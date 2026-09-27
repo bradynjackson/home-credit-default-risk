@@ -1,0 +1,411 @@
+---
+title: "Home Credit Default Risk: Exploratory Data Analysis"
+author: "Bradyn Jackson"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: false
+    embed-resources: true
+    theme: cosmo
+    fig-width: 8
+    fig-height: 5
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(scales)
+library(knitr)
+
+# A shared ggplot theme so every figure in the notebook looks consistent.
+theme_set(theme_minimal(base_size = 12))
+```
+
+# Business Problem
+
+Credit losses dominate profitability, not volume or margin. In the first quarter of 2019, impairment losses of 430 million ran against net interest income of 889 million and net profit of 126 million, consuming roughly 48% of net interest income and exceeding quarterly net profit by a factor of 3.4. A marginal improvement in risk assessment moves earnings further than almost any other factor available to the business. 
+
+The exposure runs both ways. An applicant wrongly approved becomes a write off. An applicant wrongly declined is foregone interest income and for a lender whose purpose is broadening financial inclusion, a customer is displaced by the other lenders. Current practices don’t separate these two populations as sharply as the available data should permit.  
+
+
+# Data Import and Structure
+
+```{r import}
+# application_train.csv holds one row per loan application, with the known
+# repayment outcome in TARGET. application_test.csv has the same columns minus
+# TARGET, and is the set the competition scores predictions against.
+#
+# guess_max is raised well above the default of 1000 rows. Several columns here
+# are mostly empty near the top of the file, and with a small guessing window
+# readr infers them as logical and then discards every numeric value it meets
+# further down.
+train <- read_csv("data/application_train.csv",
+                  show_col_types = FALSE, guess_max = 50000)
+test  <- read_csv("data/application_test.csv",
+                  show_col_types = FALSE, guess_max = 50000)
+
+# Compare the shape of the two files side by side.
+tibble(
+  dataset = c("application_train", "application_test"),
+  rows    = c(nrow(train), nrow(test)),
+  columns = c(ncol(train), ncol(test))
+) |>
+  kable(caption = "Dimensions of the application tables",
+        format.args = list(big.mark = ","))
+```
+
+```{r grain-check}
+# Confirm the grain of the table: one row per applicant. If SK_ID_CURR is not
+# unique, every later join and every per-applicant summary is suspect.
+tibble(
+  check = c("Rows in train", "Distinct SK_ID_CURR", "One row per applicant?"),
+  value = c(
+    comma(nrow(train)),
+    comma(n_distinct(train$SK_ID_CURR)),
+    as.character(n_distinct(train$SK_ID_CURR) == nrow(train))
+  )
+) |>
+  kable(caption = "Grain check on application_train")
+```
+
+```{r column-types}
+# How many columns of each type? This tells us roughly how much of the work
+# ahead is numeric summarisation versus categorical encoding.
+tibble(type = map_chr(train, ~ class(.x)[1])) |>
+  count(type, name = "columns") |>
+  arrange(desc(columns)) |>
+  kable(caption = "Column types in application_train")
+```
+
+The grain is what we expected. We have 307,511 rows and 307,511 distinct SK_ID_CURR. If IDs repeated, every per-applicant summary and every later join would double count. We see 16 character columns out of the 122. We are going to have to create dummy variables. With these, the table becomes wider before modeling. Train has 122 columns and test has 121 columns, the missing one being TARGET. Test is what we are predicting on, so it's withheld by design. 
+
+# The Target Variable
+
+```{r target-distribution}
+# TARGET is binary: 1 = the client had serious payment difficulty, 0 = repaid.
+target_summary <- train |>
+  count(TARGET) |>
+  mutate(
+    outcome = if_else(TARGET == 1, "Payment difficulty", "Repaid"),
+    share   = n / sum(n)
+  )
+
+target_summary |>
+  select(TARGET, outcome, n, share) |>
+  mutate(n = comma(n), share = percent(share, accuracy = 0.01)) |>
+  kable(caption = "Distribution of the target variable")
+```
+
+```{r target-plot}
+# Visualise the imbalance. The y-axis is a share of all applications rather than
+# a raw count, so the reader sees the proportion directly.
+ggplot(target_summary, aes(x = outcome, y = share, fill = outcome)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = percent(share, accuracy = 0.1)), vjust = -0.4, size = 4) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_manual(values = c("Repaid" = "#4C6EF5", "Payment difficulty" = "#E8590C")) +
+  labs(
+    title = "Most applicants repay: the target is heavily imbalanced",
+    subtitle = "Share of applications in application_train by repayment outcome",
+    x = NULL,
+    y = "Share of applications"
+  )
+```
+
+A model that predicts "everyone repays" scores a 91.93% accuracy while being useless, which is exactly why the competition scores on AUC instead. AUC asks whether the model ranks risky applicants above safe ones, which no constant prediction can fake. The default rate is 8.07%, or 24,825 applicants with real payment difficulty. The imbalance means the model's job is finding a small minority inside a large population, which will shape everything including where we set the approval threshold. 
+
+# Missing Data
+
+```{r missing-summary}
+# Count NAs in every column, then express as a share of all rows. pivot_longer
+# turns the one-row-per-column summary into a tidy table we can sort and plot.
+missing_summary <- train |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  mutate(pct_missing = n_missing / nrow(train)) |>
+  arrange(desc(pct_missing))
+
+# Group columns into severity bands rather than listing all 122 individually.
+missing_summary |>
+  mutate(band = cut(
+    pct_missing,
+    breaks = c(-Inf, 0, 0.10, 0.30, 0.50, Inf),
+    labels = c("Complete", "Under 10%", "10-30%", "30-50%", "Over 50%")
+  )) |>
+  count(band, name = "columns") |>
+  kable(caption = "Columns grouped by share of missing values")
+```
+
+```{r missing-plot}
+# Plot the twenty worst offenders so the pattern is visible at a glance.
+missing_summary |>
+  slice_head(n = 20) |>
+  mutate(variable = fct_reorder(variable, pct_missing)) |>
+  ggplot(aes(x = pct_missing, y = variable)) +
+  geom_col(fill = "#E8590C") +
+  scale_x_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Twenty columns with the most missing data",
+    subtitle = "Share of rows where the value is NA, application_train",
+    x = "Share of rows missing",
+    y = NULL
+  )
+```
+
+We have 41 columns that are missing more than 50% data. I would look at dropping the columns that are missing more than 60% of the data. For the others, we could look at filling the missing values with something (like median) and add a flag column. EXT_SOURCE_1 is one of the three strongest predictors and is 56.4% empty. A 50% cutoff would throw that away, while 60% keeps it. When looking at the top-missing columns, we see that they are all descriptions of an applicant's building - common area, apartment counts, floors - not about their finances or credit. This suggests the information was probably only collected for applicants in certain housing types. The missing data isn't as random as we may have thought. 
+
+# Data Quality: Impossible and Placeholder Values
+
+```{r days-employed}
+# The DAYS_* columns are recorded as negative numbers counted backwards from the
+# application date. Summarise DAYS_EMPLOYED to see whether the range is credible.
+train |>
+  summarise(
+    min    = min(DAYS_EMPLOYED, na.rm = TRUE),
+    median = median(DAYS_EMPLOYED, na.rm = TRUE),
+    max    = max(DAYS_EMPLOYED, na.rm = TRUE),
+    n_positive = sum(DAYS_EMPLOYED > 0, na.rm = TRUE)
+  ) |>
+  kable(caption = "DAYS_EMPLOYED summary statistics",
+        format.args = list(big.mark = ","))
+```
+
+```{r days-employed-anomaly}
+# Isolate the anomalous value and check which kinds of applicant carry it.
+# If it clusters in one income type, it is a sentinel code rather than noise.
+anomaly_value <- train |>
+  count(DAYS_EMPLOYED, sort = TRUE) |>
+  filter(DAYS_EMPLOYED > 0) |>
+  slice_head(n = 1) |>
+  pull(DAYS_EMPLOYED)
+
+train |>
+  filter(DAYS_EMPLOYED == anomaly_value) |>
+  count(NAME_INCOME_TYPE, sort = TRUE) |>
+  mutate(share = percent(n / sum(n), accuracy = 0.1), n = comma(n)) |>
+  kable(caption = paste0("Income type of applicants with DAYS_EMPLOYED = ",
+                         comma(anomaly_value)))
+```
+
+```{r days-employed-plot}
+# Compare the distribution with and without the anomalous group, converting days
+# to years and flipping the sign so the axis reads in the intuitive direction.
+train |>
+  mutate(
+    years_employed = -DAYS_EMPLOYED / 365.25,
+    group = if_else(DAYS_EMPLOYED == anomaly_value,
+                    "Placeholder value", "Plausible values")
+  ) |>
+  filter(group == "Plausible values") |>
+  ggplot(aes(x = years_employed)) +
+  geom_histogram(bins = 50, fill = "#4C6EF5") +
+  labs(
+    title = "Years of employment, placeholder rows excluded",
+    subtitle = "Distribution of DAYS_EMPLOYED converted to years before application",
+    x = "Years employed at time of application",
+    y = "Number of applicants"
+  )
+```
+
+```{r categorical-placeholders}
+# Categorical columns can carry placeholders too. Check gender and a few others
+# for codes that stand in for "unknown" rather than describing a real category.
+train |>
+  count(CODE_GENDER) |>
+  mutate(share = percent(n / sum(n), accuracy = 0.001), n = comma(n)) |>
+  kable(caption = "CODE_GENDER values")
+```
+
+```{r amount-ranges}
+# Check the monetary columns for implausible extremes. A maximum many orders of
+# magnitude above the median usually signals an entry error or an outlier that
+# will distort any model sensitive to scale.
+train |>
+  select(AMT_INCOME_TOTAL, AMT_CREDIT, AMT_ANNUITY, AMT_GOODS_PRICE) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  group_by(variable) |>
+  summarise(
+    min    = min(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    p99    = quantile(value, 0.99, na.rm = TRUE),
+    max    = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(across(min:max, ~ comma(.x, accuracy = 1))) |>
+  kable(caption = "Range of the monetary variables")
+```
+
+**The employment placeholder.** DAYS_EMPLOYED = 365,243. Divide by 365.25 and that is 1,000 years. It is a chosen sentinel. We have 22 unemployed and 55,352 Pensioners, 55,374 rows total. Dropping those values would drop 18% of our training data and nearly every pensioner in it. We want to recode it to NA and add a flag. 
+
+**The employment range.** DAYS_EMPLOYED min is -17,912, which is 49 years of employment. It is unusual but not impossible for an older applicant. 
+
+**An unknown gender code.** CODE_GENDER = XNA is 4 rows. Small in volume. XNA is Home Credit's house code for unknown. It makes no practical difference to drop the four unknown rows out of 307,511, 
+
+**An impossible income.** AMT_INCOME_TOTAL max = 117,000,000. The applicant reports an income of 117 million, but the largest loan anyone in the dataset takes is AMT_CREDIT max is 4,050,000. Someone earning 117M doesn't borrow 4M. I would look at dropping that row. 
+
+# Relationships with the Target
+
+```{r ext-source-correlation}
+# The EXT_SOURCE columns are normalised scores from outside data providers.
+# Correlate each with TARGET, using complete pairs only since all three have
+# substantial missingness.
+train |>
+  select(TARGET, starts_with("EXT_SOURCE")) |>
+  summarise(across(starts_with("EXT_SOURCE"),
+                   ~ cor(.x, TARGET, use = "complete.obs"))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "correlation") |>
+  arrange(correlation) |>
+  mutate(correlation = round(correlation, 3)) |>
+  kable(caption = "Correlation between the external scores and TARGET")
+```
+
+```{r ext-source-plot}
+# A negative correlation means higher scores go with lower default. Show the
+# distribution of each score split by outcome to see the separation directly.
+train |>
+  select(TARGET, starts_with("EXT_SOURCE")) |>
+  pivot_longer(starts_with("EXT_SOURCE"), names_to = "source", values_to = "score") |>
+  filter(!is.na(score)) |>
+  mutate(outcome = if_else(TARGET == 1, "Payment difficulty", "Repaid")) |>
+  ggplot(aes(x = score, fill = outcome)) +
+  geom_density(alpha = 0.5, colour = NA) +
+  facet_wrap(~ source, ncol = 3) +
+  scale_fill_manual(values = c("Repaid" = "#4C6EF5", "Payment difficulty" = "#E8590C")) +
+  labs(
+    title = "External scores separate the two outcomes",
+    subtitle = "Density of each external source score by repayment outcome",
+    x = "External source score",
+    y = "Density",
+    fill = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+```{r age-default-rate}
+# Convert DAYS_BIRTH to age in years, bin it, and compute the default rate in
+# each band. Binning makes the trend legible where a scatter of 300k points
+# would not.
+train |>
+  mutate(
+    age_years = -DAYS_BIRTH / 365.25,
+    age_band  = cut(age_years, breaks = seq(20, 70, by = 5), right = FALSE)
+  ) |>
+  filter(!is.na(age_band)) |>
+  group_by(age_band) |>
+  summarise(applicants = n(), default_rate = mean(TARGET), .groups = "drop") |>
+  ggplot(aes(x = age_band, y = default_rate)) +
+  geom_col(fill = "#4C6EF5") +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Default rate falls steadily with applicant age",
+    subtitle = "Share of applicants with payment difficulty, by five-year age band",
+    x = "Age at application (years)",
+    y = "Default rate"
+  )
+```
+
+```{r categorical-default-rates}
+# A reusable helper: default rate by any categorical column, with small groups
+# filtered out so a category of 30 people cannot produce a misleading rate.
+default_rate_by <- function(data, var, min_n = 500) {
+  data |>
+    group_by({{ var }}) |>
+    summarise(applicants = n(), default_rate = mean(TARGET), .groups = "drop") |>
+    filter(applicants >= min_n) |>
+    arrange(desc(default_rate))
+}
+
+default_rate_by(train, NAME_EDUCATION_TYPE) |>
+  mutate(applicants = comma(applicants),
+         default_rate = percent(default_rate, accuracy = 0.1)) |>
+  kable(caption = "Default rate by education level")
+```
+
+```{r income-type-default}
+# Same helper applied to income type, plotted rather than tabulated.
+default_rate_by(train, NAME_INCOME_TYPE) |>
+  mutate(NAME_INCOME_TYPE = fct_reorder(NAME_INCOME_TYPE, default_rate)) |>
+  ggplot(aes(x = default_rate, y = NAME_INCOME_TYPE)) +
+  geom_col(fill = "#4C6EF5") +
+  scale_x_continuous(labels = percent_format(accuracy = 0.1),
+                     expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Default rate varies widely by source of income",
+    subtitle = "Groups with at least 500 applicants, application_train",
+    x = "Default rate",
+    y = NULL
+  )
+```
+
+Pensioners have the lowest default rate of any substantial group - 5.39%, under the 8.07% base rate. Pensioners are exactly the 55,352 rows carrying the DAYS_EMPLOYED, dropping them would have deleted the safest applicants Home Credit has, and about 18% of the data. The decision to recode and flag it is correct. 
+
+The min_n = 500 filter shows the following: Unemployed shows 36% default - on 22 people. Maternity leave 40% on 5. Students and Businessmen at 0% on 18 and 10. Those rates are noise, and the filter is what keeps them out. 
+
+All three external scores are negative. But -0.179 is the strongest relationship in the dataset, which is weak in absolute terms. The density plot shows this: the two outcomes shift relative to each other, they don't separate. No single variable predicts default here, and any useful model has to combine weak signals. 
+
+Age runs about 12% at 20-25 down roughly 4% at 65-70 - triple the difference. Education runs 10.9% to 5.4%. The age gradient and the pensioner result may be measuring overlapping things, since pensioners are older by definition. You can't separate those. Age and education correlate with protected characteristics, and a model leaning on them can produce disparate outcomes without ever using a protected attribute directly. 
+
+# Comparing Train and Test
+
+```{r train-test-comparison}
+# Confirm which columns differ between the two files.
+tibble(
+  check = c("Columns in train only", "Columns in test only"),
+  value = c(
+    paste(setdiff(names(train), names(test)), collapse = ", "),
+    paste(setdiff(names(test), names(train)), collapse = ", ")
+  )
+) |>
+  kable(caption = "Column differences between train and test")
+```
+
+```{r distribution-comparison}
+# If the two sets were drawn from different populations, a model fitted on train
+# would not transfer. Compare a few key distributions as a sanity check.
+bind_rows(
+  train |> select(AMT_INCOME_TOTAL, AMT_CREDIT, DAYS_BIRTH) |> mutate(set = "train"),
+  test  |> select(AMT_INCOME_TOTAL, AMT_CREDIT, DAYS_BIRTH) |> mutate(set = "test")
+) |>
+  group_by(set) |>
+  summarise(
+    median_income = median(AMT_INCOME_TOTAL, na.rm = TRUE),
+    median_credit = median(AMT_CREDIT, na.rm = TRUE),
+    median_age    = median(-DAYS_BIRTH / 365.25, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(across(where(is.numeric), ~ round(.x, 1))) |>
+  kable(caption = "Median values compared across train and test")
+```
+
+TARGET is in train only because we predict on test, so it's being withheld by design. Age medians are nearly the same: 43.1 vs 43.2. That suggests the two sets are drawn from the same population. 
+
+Two others worth a look: test income runs about 7% higher; test 157,500 vs train 147,150. test credit runs about 12% lower; test 450,000 vs train 513,531. 
+
+Test applicants earn slightly more and borrow less. This could be sampling variation - test is 48,744 rows against train's 307,511, and medians on smaller samples move around. It could also reflect a real difference in when and how the two were drawn. 
+
+Nothing in the comparison suggests the two sets differ enough to threaten the model, but the credit gap is worth revisiting before coming to conclusions from test. Three medians is thin evidence - enough to rule out an obvious mismatch, not enough to confirm the sets match. 
+
+# Results
+
+## What problems did we find in the data? 
+
+41 of the 122 columns were over 50% empty. We found that the worst of those were all building attributes - COMMONAREA, NONLIVINGAPARTMENTS, LIVINGAPARTMENTS, FLOORSMIN. EXT_SOURCE_1 is 56.4% missing and one of our three strongest predictors. DAYS_EMPLOYED = 365,243, which is 1,000 years. There are 55,374 rows, or 18% of the data. There are 55,352 Pensioners and 22 unemployed. We will recode to NA, add a flag, and keep the rows. CODE_GENDER = XNA on 4 rows of 307,511; XNA is Home Credit's house code for unknown. AMT_INCOME_TOTAL max = 117M. Max loan in the data is 4M. 
+
+## Which relationships seem strongest? 
+
+Nothing exceeds |.18|. EXT_SOURCE_3 = -0.179, _2 = -0.16, _1 = -0.155. The density plots show a shift between outcomes, not a separation. Ages 20-25 are about 12% and fall to 4% at 65-70. Lower secondary education is about 10.9% and falls to 5.4% for higher education. Working income is 9.59%, commercial associate is 7.48%, state servant is 5.75%, and pensioner is 5.39%. Pensioners are the lowest-risk substantial group and the placeholder group. Dropping those 55,352 rows would have deleted the safest segment in the portfolio. The min_n = 500 filter is load-bearing - unemployed shows 36% on 22 people, maternity leave 40% on 5. 
+
+## How has EDA changed my thinking about the analytics approach? 
+
+No single predictor is strong. Everything found tops out below .18. That means performance will come from combining many weak signals. The best signal has the most missing data. EXT_SOURCE_1 is missing 56.4% of applicants, so the model is working with less information. Headline AUC will overstate how well it does on those applicants. The fair-lending constraint stopped being abstract. Age and education are among the most interpretable predictors, and both are proxies for protected characteristics. Weak individual signals push towards complex models that combine many features. The constraints section committed to decisions explainable to a declined applicant, and complex models make that harder. Before seeing the data, we estimated an 86M euro benefit from this analysis. The data was weaker than expected, so we want to widen the estimate putting 86M toward the top of it to account for the analysis not doing as well as we wanted.  
+
+# Use of AI
+
+I used Claude AI to help me with the codes. After coming up with what I wanted to explore in this, we went through the code. I did the interpretations and then asked AI what I missed and what needed to be improved. It helped me hone in on what to say and what points were important in the data. AI would make suggestions and I would have it explain to me why it thinks that way and why it would be beneficial to add that. I came up with the content, Claude helped me execute it. 

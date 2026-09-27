@@ -47,3 +47,13 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Project data - downloaded from Kaggle, too large for GitHub
+data/
+*.csv
+
+# Quarto render cache
+/.quarto/
+
+# macOS
+.DS_Store
