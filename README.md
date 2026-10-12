@@ -134,9 +134,37 @@ remain.
 
 ### 3. Modeling
 
-Upcoming. Candidate models will be compared on AUC-ROC against a majority-class
-baseline, then the best performer's output will be translated into projected
-loss reduction at realistic approval thresholds.
+`modeling_home_credit.qmd` (rendered to
+[`modeling_home_credit.html`](modeling_home_credit.html), a self-contained
+report with code collapsed by default and a show/hide-all toggle) builds on
+reusable functions in `modeling_functions.R`. Models were compared on mean AUC-ROC over
+the same 3-fold stratified CV splits of a 20% training sample; hyperparameters
+were searched on a 5,000-row sample, and the final model was fit on all
+307,511 rows. Exploration-stage models included `CODE_GENDER`; the final row
+does not.
+
+| Model | CV AUC |
+| --- | --- |
+| Majority-class baseline | 0.500 |
+| Random forest (500 trees) | 0.715 |
+| Logistic regression, 8 EDA predictors | 0.727 |
+| XGBoost, untuned | 0.735 |
+| Logistic regression, all predictors | 0.742 |
+| **XGBoost, tuned (500 trees), without `CODE_GENDER`** | **0.748** |
+
+- **Class imbalance:** no strategy improved AUC. Down- and upsampling inflated
+  predicted default probabilities from about 8% to 28–42%, and SMOTE produced
+  synthetic defaults a model could tell apart from real ones, so no adjustment
+  was used.
+- **Final model:** tuned XGBoost, chosen for the highest CV AUC; it beat
+  logistic regression in every fold. `CODE_GENDER` was excluded for fairness
+  at a cost of 0.002 AUC. Age and education remain as potential proxies.
+- **Benchmark:** logistic regression on all predictors (also without
+  `CODE_GENDER`, CV AUC 0.740) is kept as the interpretable benchmark, since
+  its coefficients can be read and explained.
+- **Kaggle:** private AUC **0.75817** (public 0.75608), above the CV estimate,
+  most likely because the final model trained on all rows rather than one CV
+  fold's ~41,000.
 
 ## Repository Structure
 
@@ -146,6 +174,9 @@ home-credit-default-risk/
 ├── eda_home_credit.qmd       # exploratory analysis source
 ├── eda_home_credit.html      # rendered EDA report
 ├── data_preparation.R        # reusable cleaning and feature functions
+├── modeling_home_credit.qmd  # modeling notebook source
+├── modeling_home_credit.html # rendered modeling report
+├── modeling_functions.R      # reusable sampling, recipe, model and tuning functions
 ├── .gitignore
 └── README.md
 ```

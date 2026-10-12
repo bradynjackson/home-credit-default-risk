@@ -1,0 +1,863 @@
+---
+title: "Home Credit Default Risk: Modeling"
+author: "Bradyn Jackson"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+    fig-width: 8
+    fig-height: 5
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(scales)
+library(knitr)
+
+# Loads tidymodels and the shared constants (MODEL_SEED, CV_FOLDS, ...).
+source("modeling_functions.R")
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+# Introduction
+
+This notebook builds a model that estimates each applicant's probability of
+default from the application data prepared in `data_preparation.R`. Candidate
+models are compared on AUC-ROC, which measures how well a model ranks
+defaulters above non-defaulters. Accuracy is reported alongside it only to show
+why it misleads here: with about 8% of applicants defaulting, a model that
+predicts "no default" for everyone is about 92% accurate and has no value.
+
+`TARGET` is a factor with levels `"1"` (default) and `"0"`. Default is the
+first level, which makes it the event level for every yardstick metric.
+
+Evaluation runs in three tiers, each sized to its job:
+
+| Tier | Data | Resampling | Purpose |
+| --- | --- | --- | --- |
+| Comparison | 20% stratified sample | 3-fold stratified CV | Compare candidate models and imbalance strategies on identical folds |
+| Tuning | 5,000-row stratified sample | 3-fold stratified CV | Randomized hyperparameter search |
+| Final | All 307,511 training rows | None | Final fit, then predict on test for Kaggle |
+
+# Data preparation
+
+`load_prepared()` runs the pipeline in `data_preparation.R` and caches the
+result to `data/prepared.rds`. Later renders read the cache, and the cache
+rebuilds automatically whenever `data_preparation.R` changes. All preparation
+parameters are fit on the training data only.
+
+```{r load}
+prepared <- load_prepared()
+train    <- prepared$train
+test     <- prepared$test
+
+tibble(
+  set     = c("train", "test"),
+  rows    = c(nrow(train), nrow(test)),
+  columns = c(ncol(train), ncol(test))
+) |>
+  kable(format.args = list(big.mark = ","))
+```
+
+```{r target}
+levels(train$TARGET)
+
+train |>
+  count(TARGET) |>
+  mutate(share = percent(n / sum(n), accuracy = 0.01)) |>
+  kable(format.args = list(big.mark = ","))
+```
+
+## Evaluation tiers
+
+Both samples are stratified on `TARGET`, so each keeps the full training
+default rate. Sizes are allocated per class rather than drawn per group, which
+would return a balanced sample and quietly apply an imbalance strategy.
+
+```{r tiers}
+compare_data  <- stratified_sample(train, prop = COMPARE_PROP)
+compare_folds <- make_cv_folds(compare_data)
+
+tune_data  <- stratified_sample(train, n = TUNE_N)
+tune_folds <- make_cv_folds(tune_data)
+
+tibble(
+  tier         = c("Comparison", "Tuning", "Final"),
+  rows         = c(nrow(compare_data), nrow(tune_data), nrow(train)),
+  default_rate = c(mean(compare_data$TARGET == "1"),
+                   mean(tune_data$TARGET == "1"),
+                   mean(train$TARGET == "1"))
+) |>
+  mutate(default_rate = percent(default_rate, accuracy = 0.01)) |>
+  kable(format.args = list(big.mark = ","))
+```
+
+Each comparison fold's assessment set should carry the same default rate.
+`make_cv_folds()` passes `pool = 0.05` because rsample's default of 0.1 would
+dissolve the 8% default stratum and leave the folds unstratified.
+
+```{r fold-check}
+compare_folds |>
+  mutate(
+    assess_rows  = map_int(splits, \(s) nrow(assessment(s))),
+    defaults     = map_int(splits, \(s) sum(assessment(s)$TARGET == "1")),
+    default_rate = map_dbl(splits, \(s) mean(assessment(s)$TARGET == "1"))
+  ) |>
+  select(id, assess_rows, defaults, default_rate) |>
+  mutate(default_rate = percent(default_rate, accuracy = 0.01)) |>
+  kable(format.args = list(big.mark = ","))
+```
+
+# Baseline
+
+The majority-class classifier predicts "no default" for every applicant. It is
+scored on the comparison folds, the same folds every candidate model will use.
+
+```{r baseline}
+baseline <- baseline_majority(compare_folds)
+
+baseline$summary |> kable(digits = 4)
+```
+
+```{r baseline-folds}
+baseline$per_fold |>
+  select(id, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  kable(digits = 4)
+```
+
+The baseline's accuracy of
+`r percent(filter(baseline$summary, .metric == "accuracy")$mean, accuracy = 0.1)`
+comes entirely from the class imbalance. Its AUC of
+`r number(filter(baseline$summary, .metric == "roc_auc")$mean, accuracy = 0.001)`
+is the floor: a constant prediction ranks no applicant above another. A useful
+model has to beat 0.5 AUC.
+
+# Candidate models
+
+Four candidates are scored with `fit_resamples()` on the comparison folds, the
+same folds as the baseline. No class-imbalance adjustment is applied yet; that
+is the next section.
+
+| Model | Predictors | Preprocessing |
+| --- | --- | --- |
+| Logistic regression (a) | 8 chosen from the EDA | pool rare levels, dummies, drop zero-variance |
+| Logistic regression (b) | All | pool rare levels, dummies, drop zero-variance, drop exact linear combinations |
+| Random forest (ranger, 500 trees) | All | pool rare levels, drop zero-variance (factors used natively) |
+| XGBoost (500 trees, learn rate 0.05) | All | pool rare levels, dummies, drop zero-variance |
+
+## Predictor set (a)
+
+```{r set-a}
+# The nine proposed from the EDA. set_a, the final eight, is defined after
+# the screening below.
+set_a_candidates <- c("EXT_SOURCE_MEAN", "AGE_BAND", "NAME_EDUCATION_TYPE",
+                      "NAME_INCOME_TYPE", "YEARS_EMPLOYED", "CREDIT_INCOME_RATIO",
+                      "ANNUITY_INCOME_RATIO", "CREDIT_TERM", "CREDIT_GOODS_RATIO")
+```
+
+| Predictor | Reason (EDA finding) |
+| --- | --- |
+| `EXT_SOURCE_MEAN` | The external scores are the strongest predictors (−0.179, −0.160, −0.155). The mean, rather than the three columns, avoids median-imputing the 56.4% of rows missing `EXT_SOURCE_1`. |
+| `AGE_BAND` | Default falls from 12.29% at 20–25 to 3.66% at 65–70, flattening in the middle; bands capture that shape in a linear model. |
+| `NAME_EDUCATION_TYPE` | Default rate runs from 10.9% to 5.4% across education levels. |
+| `NAME_INCOME_TYPE` | Pensioners default at 5.39%, the lowest of any substantial group. Also stands in for the employment placeholder flag, which marks the same rows. |
+| `YEARS_EMPLOYED` | Recoding the 365,243 placeholder kept a real employment length for working applicants. |
+| `CREDIT_INCOME_RATIO` (dropped, see below) | Loan amounts span 45k to 4.05M against a 147k median income; leverage puts the loan in context. |
+| `ANNUITY_INCOME_RATIO` | Same finding; affordability of the payment. |
+| `CREDIT_TERM` | Same finding; implied repayment term. |
+| `CREDIT_GOODS_RATIO` | Same finding; credit taken on top of the goods price. |
+
+Excluded deliberately: `CODE_GENDER` (fairness), the three separate
+`EXT_SOURCE_*` columns, any second version of age, and raw `AMT_*` amounts.
+
+Rows 1–4 have a measured relationship with `TARGET` in the EDA; rows 5–9 rest
+on data-quality findings. As a check, each predictor's single-variable AUC is
+measured on the 80% of training rows **outside** the comparison sample, so
+screening never touches the rows the models are scored on. Numeric predictors
+are scored by raw value and factors by their level's default rate. A raw-value
+AUC only sees monotone relationships, so a low score means "no monotone
+signal", not necessarily "no signal".
+
+```{r set-a-screen}
+screen_data <- anti_join(train, compare_data, by = "SK_ID_CURR")
+
+univariate_auc(screen_data, set_a_candidates) |>
+  mutate(flag = if_else(auc < 0.52, "below 0.52", "")) |>
+  kable(digits = 3)
+```
+
+`CREDIT_INCOME_RATIO` falls below 0.52. Binning it into deciles on the same
+screening rows shows whether that reflects no signal or a curved one:
+
+```{r credit-income-bins}
+credit_income_bins <- binned_default_rate(screen_data, "CREDIT_INCOME_RATIO")
+
+credit_income_bins$table |>
+  mutate(default_rate = percent(default_rate, accuracy = 0.01)) |>
+  kable(digits = 2, format.args = list(big.mark = ","))
+```
+
+Binned AUC: `r number(credit_income_bins$auc, accuracy = 0.001)`.
+
+`CREDIT_INCOME_RATIO` is dropped from set (a): default rate traces an inverted
+U, rising from about 7.0% to 9.1% at mid-range ratios and falling back to 7.0%
+at the top, so its binned AUC of 0.529 comes from a curve that a linear
+logistic term cannot use; the all-predictor models keep it, where trees can
+pick up the curve.
+
+```{r set-a-final}
+set_a <- setdiff(set_a_candidates, "CREDIT_INCOME_RATIO")
+```
+
+## Recipes and workflows
+
+Every recipe gives `SK_ID_CURR` the `"id"` role and pools levels under 1% of
+rows into `"other"`. Rare levels such as Businessman, Student and Academic
+degree hold a handful of rows with few or no defaults, which would push glm
+coefficients toward infinity. Recipe (b) also drops exact linear
+combinations. Prepped on the comparison sample, it removes:
+
+```{r lincomb-removed}
+recipe_b <- prep(build_recipe(compare_data, lincomb = TRUE), compare_data)
+lincomb_step <- which(map_lgl(recipe_b$steps, \(s) inherits(s, "step_lincomb")))
+
+tidy(recipe_b, number = lincomb_step) |> select(removed = terms) |> kable()
+```
+
+The `YEARS_*` columns and `AGE_YEARS` are rescaled `DAYS_*` columns, by
+construction in `engineer_features()`. The other two removals rest on
+identities in the data, checked here as the share of comparison-sample rows
+where each holds:
+
+```{r lincomb-identities}
+car_ok <- (compare_data$FLAG_OWN_CAR == "Y") == (compare_data$FLAG_MISSING_OWN_CAR_AGE == 0)
+fam_ok <- compare_data$CNT_FAM_MEMBERS == compare_data$CNT_CHILDREN + 1 +
+  (compare_data$NAME_FAMILY_STATUS %in% c("Married", "Civil marriage"))
+fam_exceptions <- count(compare_data[!fam_ok, ], NAME_FAMILY_STATUS)
+
+tibble(
+  identity = c("FLAG_OWN_CAR = Y exactly when car age is recorded",
+               "CNT_FAM_MEMBERS = CNT_CHILDREN + 1 (+1 if married or civil marriage)"),
+  rows_holding  = c(sum(car_ok), sum(fam_ok)),
+  share_of_rows = c(mean(car_ok), mean(fam_ok)),
+  exceptions    = c(sum(!car_ok), sum(!fam_ok))
+) |>
+  mutate(share_of_rows = percent(share_of_rows, accuracy = 0.001)) |>
+  kable(format.args = list(big.mark = ","))
+
+fam_exceptions |> kable()
+```
+
+So `FLAG_OWN_CAR_Y` is the complement of the missing-car-age flag. The
+family-size identity fails on `r sum(!fam_ok)` row(s), all with family status
+`r paste(fam_exceptions$NAME_FAMILY_STATUS, collapse = ", ")`, a level
+`step_other()` pools into its own `other` dummy, so within the recipe's
+columns one family-status dummy is fully determined by family size, number of
+children and the remaining dummies.
+
+```{r workflows}
+cv_metrics <- metric_set(roc_auc, accuracy)
+
+candidates <- list(
+  logreg_small  = workflow(build_recipe(compare_data, set_a), logistic_spec()),
+  logreg_all    = workflow(build_recipe(compare_data, lincomb = TRUE), logistic_spec()),
+  random_forest = workflow(build_recipe(compare_data, dummy = FALSE), rf_spec()),
+  xgboost       = workflow(build_recipe(compare_data), xgb_spec())
+)
+```
+
+## Cross-validated fits
+
+Each result is saved to `data/cv_<model>.rds` and reloaded on later renders.
+The line printed for each model says whether it was fit or loaded. Fit times
+are wall-clock seconds across all three folds, recipe preparation included,
+using `r N_THREADS` threads for the tree models.
+
+```{r fit-candidates}
+candidate_fits <- imap(candidates, \(wf, name)
+  fit_resamples_cached(name, wf, compare_folds, cv_metrics))
+```
+
+Warnings and errors raised during fitting:
+
+```{r fit-notes}
+fit_notes <- map(candidate_fits, \(f) collect_notes(f$result)) |>
+  list_rbind(names_to = "model")
+
+if (nrow(fit_notes) == 0) {
+  cat("None.\n")
+} else {
+  fit_notes |> count(model, type, note) |> kable()
+}
+```
+
+## Comparison
+
+```{r compare}
+comparison <- compare_models(baseline, candidate_fits)
+
+comparison |>
+  mutate(fit_seconds = round(fit_seconds, 1)) |>
+  kable(digits = 4)
+```
+
+The top two models were scored on identical folds, so they can be compared
+fold by fold:
+
+```{r paired}
+paired <- paired_folds(candidate_fits$logreg_all, candidate_fits$xgboost)
+
+paired |> kable(digits = 4)
+
+paired |> count(winner, name = "folds_won") |> kable()
+```
+
+# Class imbalance
+
+Defaults are 8% of rows. Three resampling strategies from themis are compared
+against no adjustment, for the two strongest candidates, on the comparison
+folds:
+
+- **Downsample**: drop non-defaults at random until the classes are 50/50.
+- **Upsample**: repeat defaults at random until the classes are 50/50.
+- **SMOTE**: create synthetic defaults from each default and its nearest
+  default neighbours until the classes are 50/50. This uses SMOTENC, the
+  variant for mixed data: numeric columns are interpolated, categorical
+  columns take the neighbours' most common value. Numeric 0/1 columns are
+  converted to factors first so they are treated as categorical, and the
+  dummies are created afterwards.
+
+Every themis step has `skip = TRUE`, so it runs only when the recipe is
+prepped on a fold's analysis set. Assessment rows are never resampled.
+
+```{r imbalance-recipes}
+imbalance_models <- list(
+  logreg_all = list(lincomb = TRUE,  spec = logistic_spec()),
+  xgboost    = list(lincomb = FALSE, spec = xgb_spec())
+)
+
+imbalance_grid <- expand_grid(model    = names(imbalance_models),
+                              strategy = IMBALANCE_STRATEGIES) |>
+  mutate(name     = paste("imb", model, strategy, sep = "_"),
+         workflow = map2(model, strategy, \(m, s) workflow(
+           build_recipe(compare_data, lincomb = imbalance_models[[m]]$lincomb,
+                        imbalance = s),
+           imbalance_models[[m]]$spec)))
+
+# Every step in each recipe with its skip flag: only the themis step skips.
+imbalance_grid |>
+  filter(model == "logreg_all") |>
+  mutate(steps = map(workflow, \(wf) {
+    steps <- extract_preprocessor(wf)$steps
+    tibble(order = seq_along(steps),
+           step  = map_chr(steps, \(s) class(s)[1]),
+           skip  = map_lgl(steps, "skip"))
+  })) |>
+  select(strategy, steps) |>
+  unnest(steps) |>
+  filter(skip | step %in% c("step_bin2factor", "step_dummy")) |>
+  kable()
+```
+
+```{r imbalance-fits}
+imbalance_fits <- map2(imbalance_grid$name, imbalance_grid$workflow,
+  \(name, wf) fit_resamples_cached(name, wf, compare_folds, cv_metrics,
+                                   control = control_resamples(save_pred = TRUE))) |>
+  set_names(imbalance_grid$name)
+```
+
+Each fit should predict every assessment row exactly once, at the true
+default rate, which confirms the assessment sets were not resampled:
+
+```{r imbalance-assessment-check}
+map(imbalance_fits, \(f) collect_predictions(f$result) |>
+      summarise(predictions = n(), default_rate = mean(TARGET == "1"))) |>
+  list_rbind(names_to = "fit") |>
+  mutate(compare_rows = nrow(compare_data),
+         default_rate = percent(default_rate, accuracy = 0.01)) |>
+  kable(format.args = list(big.mark = ","))
+```
+
+Synthetic rows should be indistinguishable from real ones. First, on every
+binary column: counting SMOTE training rows that hold a binary-column value no
+real row has, on the first fold:
+
+```{r smote-check}
+smote_fractional_rows(
+  build_recipe(compare_data, imbalance = "smote"),
+  compare_folds$splits[[1]]
+) |>
+  mutate(recognisable_defaults = percent(recognisable_defaults)) |>
+  kable(format.args = list(big.mark = ","))
+```
+
+::: {.callout-note collapse="true"}
+## First attempt: SMOTE after the dummies
+
+The first version placed plain `step_smote()` after `step_dummy()`. SMOTE then
+interpolated every 0/1 column, producing in-between values that no real
+applicant has. Nearly every synthetic row held such a value, and every one was
+a default. XGBoost could isolate the synthetic rows with a split on any binary
+column and otherwise learn from the original data: its AUC and mean predicted
+default barely moved from no adjustment, while the other resampled fits'
+predictions inflated sharply. A result that
+looked like "SMOTE preserves calibration" was the model detecting synthetic
+data. SMOTENC before the dummies removes that artifact, as checked above,
+but not the problem, as the next check shows.
+:::
+
+The binary check passes, but it only covers binary columns. A broader test
+trains XGBoost to separate synthetic defaults from real ones using every
+column; it is cached like the model fits.
+
+```{r smote-detectability}
+smote_detect <- run_cached("smote_detectability", \()
+  synthetic_detectability(build_recipe(compare_data, imbalance = "smote"),
+                          compare_folds$splits[[1]]))
+
+smote_detect$result |>
+  mutate(synthetic_off_integer = percent(synthetic_off_integer, accuracy = 0.1)) |>
+  kable(digits = 4, format.args = list(big.mark = ","))
+```
+
+```{r imbalance-compare}
+imbalance_results <- summarise_fits(imbalance_fits) |>
+  left_join(select(imbalance_grid, name, model, strategy), by = c("fit" = "name")) |>
+  select(model, strategy, roc_auc, roc_auc_std_err, accuracy,
+         mean_pred_default, fit_seconds) |>
+  arrange(model, desc(roc_auc))
+
+imbalance_results |>
+  mutate(mean_pred_default = percent(mean_pred_default, accuracy = 0.1),
+         fit_seconds       = round(fit_seconds, 1)) |>
+  kable(digits = 4)
+```
+
+The true default rate on the assessment sets is
+`r percent(mean(compare_data$TARGET == "1"), accuracy = 0.01)`.
+
+No resampling strategy improved AUC for either model, so both carry forward
+with no imbalance adjustment. Down- and upsampling cost up to 0.009 AUC and
+inflate the mean predicted default from about 8% to 28–42%, which would break
+the use of the output as a default probability. SMOTE failed in both forms:
+SMOTENC fixed the binary columns, but synthetic defaults remain almost
+perfectly separable from real ones (detection AUC
+`r number(smote_detect$result$detection_auc, accuracy = 0.001)`), because interpolation leaves every one of them
+between the integers of some count or day column. The logistic drop was not
+diagnosed further.
+
+# Hyperparameter tuning
+
+XGBoost is tuned without an imbalance step, the strategy carried forward from
+the previous section. Six parameters are searched with a random grid of 20
+configurations on the tuning tier (5,000 rows, 3-fold CV); the tree count is
+fixed at 500. `mtry`'s upper bound is the predictor count after preprocessing,
+so it is finalized against the tuning data.
+
+```{r tune}
+xgb_tune_wf <- workflow(build_recipe(tune_data), xgb_tune_spec())
+xgb_grid    <- random_tune_grid(xgb_tune_wf, tune_data, size = 20)
+
+xgb_tuning <- tune_grid_cached("xgb_tuning", xgb_tune_wf, tune_folds,
+                               xgb_grid, cv_metrics)
+```
+
+The five best configurations by mean AUC on the tuning folds:
+
+```{r tune-top5}
+show_best(xgb_tuning$result, metric = "roc_auc", n = 5) |>
+  select(-.metric, -.estimator) |>
+  kable(digits = 4)
+```
+
+With about 400 defaults in 5,000 rows, those AUCs are noisy, and the top few
+may be separated by less than their standard errors. The top three are
+re-scored on the comparison folds, and the best there is selected.
+
+```{r tune-rescore}
+xgb_rescored <- rescore_top(xgb_tuning, xgb_tune_wf, compare_folds, cv_metrics, n = 3)
+
+rescore_table <- show_best(xgb_tuning$result, metric = "roc_auc", n = 3) |>
+  select(.config, mtry:sample_size, tuning_auc = mean) |>
+  left_join(
+    map(xgb_rescored, \(f) collect_metrics(f$result)) |>
+      list_rbind(names_to = ".config") |>
+      filter(.metric == "roc_auc") |>
+      select(.config, compare_auc = mean, compare_std_err = std_err),
+    by = ".config") |>
+  arrange(desc(compare_auc))
+
+rescore_table |> kable(digits = 4)
+
+best_config <- rescore_table$.config[1]
+xgb_tuned   <- xgb_rescored[[best_config]]
+```
+
+## Tuned vs untuned
+
+All three models below were scored on the same comparison folds.
+
+```{r tune-compare}
+compare_models(NULL, list(candidate_fits$logreg_all,
+                          candidate_fits$xgboost,
+                          xgb_tuned)) |>
+  mutate(fit_seconds = round(fit_seconds, 1)) |>
+  kable(digits = 4)
+```
+
+```{r tune-paired}
+tuned_paired <- paired_folds(candidate_fits$logreg_all, xgb_tuned)
+
+tuned_paired |> kable(digits = 4)
+
+tuned_paired |> count(winner, name = "folds_won") |> kable()
+```
+
+Tuning lifted XGBoost from 0.7353 to 0.7498 mean CV AUC on the comparison
+folds, overtaking logreg_all (0.7415) in all three folds by 0.005 to 0.012.
+The 5,000-row ranking was unreliable on its own: its top configuration
+finished last of the three on the comparison folds and the winner had ranked
+third, which is why the re-score was worth running. Because the winner was
+chosen on the same folds it is reported on, 0.7498 is slightly optimistic;
+the Kaggle test score is the independent check.
+
+## Tree count
+
+```{r learn-rate-range}
+learn_rate_param <- extract_parameter_set_dials(xgb_tune_wf) |>
+  filter(id == "learn_rate") |>
+  pull(object) |>
+  pluck(1)
+
+lr_log_range  <- unlist(range_get(learn_rate_param, original = FALSE))
+lr_range      <- learn_rate_param$trans$inverse(lr_log_range)
+lr_median     <- learn_rate_param$trans$inverse(mean(lr_log_range))
+```
+
+Every top configuration has a small learning rate. parsnip searches
+`learn_rate` uniformly on a log scale from
+`r signif(lr_range[1], 2)` to `r signif(lr_range[2], 3)`, so half of all
+random draws fall below about `r signif(lr_median, 2)` (here,
+`r sum(collect_metrics(xgb_tuning$result) |> filter(.metric == "roc_auc") |> pull(learn_rate) < 0.01)`
+of 20 fell below 0.01), and with trees fixed at 500 a small rate may stop
+short of convergence. The winning configuration is re-scored at 500, 1,000,
+1,500 and 2,000 trees on the comparison folds. The fewest trees within 0.001
+AUC of the best are chosen: smaller gains count as flat.
+
+```{r trees-sweep}
+best_params <- rescore_table |> slice(1) |> select(mtry:sample_size)
+
+trees_sweep <- sweep_trees(extract_preprocessor(xgb_tune_wf), best_params,
+                           trees = c(500, 1000, 1500, 2000),
+                           folds = compare_folds, metrics = cv_metrics)
+
+compare_models(NULL, trees_sweep) |>
+  mutate(trees = as.integer(str_extract(model, "[0-9]+$")), .before = 1) |>
+  arrange(trees) |>
+  mutate(gain_vs_previous = roc_auc - lag(roc_auc),
+         fit_seconds      = round(fit_seconds, 1)) |>
+  kable(digits = 4)
+
+best_trees <- pick_trees(trees_sweep)
+```
+
+More trees made the model worse at every step, so the small learning rate
+was not leaving it short of convergence: with trees 12 levels deep, extra
+rounds overfit the analysis folds. Chosen: **`r best_trees` trees**. This choice, like the configuration itself,
+was made on the comparison folds, so its AUC there is slightly optimistic.
+
+# Final model
+
+## Excluding CODE_GENDER
+
+Every model so far used all predictors, `CODE_GENDER` included. Set (a)
+excluded it for fairness, but the all-predictor models did not, so the
+final-stage models drop it and are re-scored on the comparison folds. The
+paired table below shows what it was contributing: removing it lowered AUC in
+every fold for both models.
+
+```{r nogender-rescore}
+final_exclude <- "CODE_GENDER"
+
+nogender_fits <- list(
+  xgb_tuned = fit_resamples_cached("xgb_tuned_nogender",
+    finalize_workflow(
+      workflow(build_recipe(compare_data, exclude = final_exclude),
+               xgb_tune_spec(trees = best_trees)),
+      best_params),
+    compare_folds, cv_metrics),
+  logreg_all = fit_resamples_cached("logreg_all_nogender",
+    workflow(build_recipe(compare_data, lincomb = TRUE, exclude = final_exclude),
+             logistic_spec()),
+    compare_folds, cv_metrics)
+)
+
+with_gender <- list(xgb_tuned  = trees_sweep[[as.character(best_trees)]],
+                    logreg_all = candidate_fits$logreg_all)
+
+gender_paired <- imap(nogender_fits, \(without, model)
+  paired_folds(with_gender[[model]], without) |>
+    select(id, with_gender = 2, without_gender = 3, difference) |>
+    mutate(model = model, .before = 1)) |>
+  list_rbind()
+
+gender_paired |>
+  rename(cost_of_excluding = difference) |>
+  kable(digits = 4)
+
+gender_cost <- gender_paired |>
+  group_by(model) |>
+  summarise(mean_cost = mean(difference), .groups = "drop") |>
+  deframe()
+```
+
+Excluding `CODE_GENDER` costs
+`r number(gender_cost[["xgb_tuned"]], accuracy = 0.0001)` mean CV AUC for
+tuned XGBoost and `r number(gender_cost[["logreg_all"]], accuracy = 0.0001)`
+for logreg_all.
+
+The cost is small but consistent: removing gender lowered AUC in every fold
+for both models.
+
+## Final fit
+
+Tuned XGBoost with `r best_trees` trees, no imbalance step and no
+`CODE_GENDER`, fit on all `r comma(nrow(train))` training rows. The fitted
+workflow, recipe included, is saved to `models/` and reloaded on later renders.
+
+```{r final-fit}
+final_wf <- finalize_workflow(
+  workflow(build_recipe(train, exclude = final_exclude),
+           xgb_tune_spec(trees = best_trees)),
+  best_params)
+
+final <- fit_final_cached("xgb_tuned_final_nogender", final_wf, train)
+final_fit <- final$result
+
+best_params |>
+  mutate(trees = best_trees, fit_seconds = round(final$seconds, 1)) |>
+  kable(digits = 4)
+```
+
+## Variable importance
+
+```{r importance}
+#| fig-height: 6
+importance <- xgb_importance(final_fit, n = 20)
+
+importance |>
+  mutate(feature = fct_reorder(feature, gain)) |>
+  ggplot(aes(x = gain, y = feature)) +
+  geom_col(fill = "#4C6EF5", width = 0.7) +
+  scale_x_continuous(labels = percent_format(accuracy = 1),
+                     breaks = seq(0, 0.3, by = 0.1),
+                     limits = c(0, 0.3),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(
+    title = "External scores dominate the final model",
+    subtitle = "Top 20 features, share of total gain",
+    x = "Share of total gain",
+    y = NULL
+  ) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank())
+```
+
+Where the potential proxies rank, and confirmation that no gender feature
+remains:
+
+```{r proxy-rank}
+all_importance <- xgb_importance(final_fit, n = Inf) |>
+  mutate(rank = row_number())
+
+cat("Gender features in the final model:",
+    sum(str_starts(all_importance$feature, "CODE_GENDER")), "\n")
+
+all_importance |>
+  filter(str_starts(feature, "AGE_|DAYS_BIRTH|NAME_EDUCATION_TYPE")) |>
+  kable(digits = 4)
+
+rank_of  <- \(f) all_importance$rank[all_importance$feature == f]
+gain_of  <- \(f) all_importance$gain[all_importance$feature %in% f]
+age_cols <- c("DAYS_BIRTH", "AGE_YEARS")
+
+ext_source_share <- sum(all_importance$gain[str_starts(all_importance$feature, "EXT_SOURCE")])
+age_share        <- sum(gain_of(age_cols))
+age_rank         <- 1 + sum(all_importance$gain[!all_importance$feature %in% age_cols] > age_share)
+
+tibble(
+  measure = c("EXT_SOURCE_MEAN share of gain", "EXT_SOURCE_* family share of gain",
+              "Age (DAYS_BIRTH + AGE_YEARS) share of gain", "Rank of combined age"),
+  value   = c(percent(gain_of("EXT_SOURCE_MEAN"), accuracy = 0.1),
+              percent(ext_source_share, accuracy = 0.1),
+              percent(age_share, accuracy = 0.1),
+              as.character(age_rank))
+) |>
+  kable()
+```
+
+The top features match the EDA: the external scores dominate, with
+`EXT_SOURCE_MEAN` alone carrying
+`r percent(gain_of("EXT_SOURCE_MEAN"), accuracy = 1)` of total gain and the
+`EXT_SOURCE_*` family `r percent(ext_source_share, accuracy = 1)`, and age
+appears at ranks `r rank_of("DAYS_BIRTH")` (`DAYS_BIRTH`) and
+`r rank_of("AGE_YEARS")` (`AGE_YEARS`). Age appears twice because the XGBoost
+recipe has no `step_lincomb()`, so `AGE_YEARS` (a rescaled `DAYS_BIRTH`) stays
+in and the two split age's importance between them; together they hold
+`r percent(age_share, accuracy = 0.1)` of gain, which would rank
+`r ordinal(age_rank)`, so each row understates age (`DAYS_ID_PUBLISH` and
+`YEARS_ID_PUBLISHED` split the same way). Two engineered ratios that the EDA
+motivated only through data-quality findings rank highly, `CREDIT_TERM`
+(`r ordinal(rank_of("CREDIT_TERM"))`) and `CREDIT_GOODS_RATIO`
+(`r ordinal(rank_of("CREDIT_GOODS_RATIO"))`), while `DAYS_LAST_PHONE_CHANGE`
+(`r ordinal(rank_of("DAYS_LAST_PHONE_CHANGE"))`) was never examined in the
+EDA.
+
+<!-- Model card note: CODE_GENDER is excluded from the final model (and from
+the logreg_all benchmark). That is not the whole fairness story. The EDA found
+age and education correlate with protected characteristics, and both remain
+in the final model (ranks in the table above). A model can produce disparate
+outcomes through these proxies without using a protected attribute directly.
+Report this on the model card. -->
+
+# Kaggle submission
+
+## Drift check
+
+The EDA found test applicants' median income about 7% higher and median credit
+about 12% lower than train. Before predicting, the model's key numeric
+predictors (those in the top 20 by gain, plus the income and credit columns
+behind that finding) are compared between train and test.
+
+```{r drift}
+drift_cols <- union(
+  intersect(importance$feature, names(select(test, where(is.numeric)))),
+  c("AMT_INCOME_TOTAL", "AMT_CREDIT", "CREDIT_INCOME_RATIO"))
+
+drift_table(train, test, drift_cols) |>
+  arrange(desc(abs(smd))) |>
+  mutate(flag = if_else(abs(smd) > 0.1, "|SMD| > 0.1", "")) |>
+  kable(digits = 3, format.args = list(big.mark = ","))
+```
+
+```{r predict-test}
+test_pred  <- predict(final_fit, test,  type = "prob")$.pred_1
+train_pred <- predict(final_fit, train, type = "prob")$.pred_1
+
+tibble(
+  set                    = c("train (in-sample)", "test"),
+  mean_predicted_default = c(mean(train_pred), mean(test_pred)),
+  actual_default_rate    = c(mean(train$TARGET == "1"), NA)
+) |>
+  mutate(across(-set, \(x) percent(x, accuracy = 0.01))) |>
+  kable()
+```
+
+Seven key predictors shift by more than 0.1 SMD, and all are loan-amount
+features: test loans are smaller relative to income (`CREDIT_INCOME_RATIO`,
+−0.33) and carry higher payments relative to the loan, meaning shorter implied
+terms (`CREDIT_TERM`, +0.55), the largest shift and the model's
+`r ordinal(rank_of("CREDIT_TERM"))` most important feature. The external scores and age, which carry most of the
+model's gain, are stable (|SMD| < 0.06), and the mean predicted default on
+test matches the training rate, so the shift does not move the overall risk
+level. It may still weaken how well `CREDIT_TERM` ranks test applicants, which
+the gap between CV and Kaggle AUC will show.
+
+## Submission file
+
+`TARGET` is the predicted probability of default (`.pred_1`), not a class:
+Kaggle scores this competition on AUC, which needs a ranking.
+
+```{r submission}
+submission <- tibble(SK_ID_CURR = test$SK_ID_CURR, TARGET = test_pred)
+validate_submission(submission, test)
+
+dir.create("submissions", showWarnings = FALSE)
+submission_path <- "submissions/submission_xgb_tuned_nogender.csv"
+write_csv(submission, submission_path)
+
+# Validate the file as written, not just the object in memory.
+validate_submission(read_csv(submission_path, show_col_types = FALSE), test) |>
+  kable()
+```
+
+## Kaggle score
+
+| Submission | Public AUC | Private AUC |
+| --- | --- | --- |
+| `submission_xgb_tuned_nogender.csv` | 0.75608 | 0.75817 |
+
+# Results
+
+## Every model on the comparison folds
+
+All rows were scored on the same three comparison folds (20% stratified
+sample), so they are directly comparable. Every exploration-stage model
+(candidates through tree count) included `CODE_GENDER`; only the two
+final-stage rows exclude it.
+
+```{r results-all}
+all_fits <- c(candidate_fits,
+              imbalance_fits[!str_ends(names(imbalance_fits), "_none")],
+              unname(xgb_rescored),
+              unname(trees_sweep),
+              unname(nogender_fits))
+
+compare_models(baseline, all_fits) |>
+  mutate(stage = case_when(
+    model == "majority_class"          ~ "Baseline",
+    str_ends(model, "_nogender")       ~ "Final (no CODE_GENDER)",
+    str_starts(model, "imb_")          ~ "Class imbalance",
+    str_starts(model, "xgb_tuned_")    ~ "Tuning (top 3 re-scored, 500 trees)",
+    str_starts(model, "xgb_trees_")    ~ "Tree count",
+    TRUE                               ~ "Candidate"),
+    .before = 1) |>
+  mutate(fit_seconds = round(fit_seconds, 1)) |>
+  kable(digits = 4)
+```
+
+## Model choice
+
+The two final-stage models, both without `CODE_GENDER`, fold by fold:
+
+```{r final-paired}
+cv_auc <- \(f) collect_metrics(f$result) |> filter(.metric == "roc_auc") |> pull(mean)
+
+final_paired <- paired_folds(nogender_fits$logreg_all, nogender_fits$xgb_tuned)
+final_paired |> kable(digits = 4)
+```
+
+**The final model is tuned XGBoost without `CODE_GENDER`**, chosen because it
+predicts best: mean CV AUC
+`r number(cv_auc(nogender_fits$xgb_tuned), accuracy = 0.0001)`, ahead of
+logreg_all without gender
+(`r number(cv_auc(nogender_fits$logreg_all), accuracy = 0.0001)`) in
+`r sum(final_paired$winner == nogender_fits$xgb_tuned$name)` of 3 folds. The
+accuracy metric played no part: at the 0.5 cutoff every unresampled model sits
+within 0.001 of the 91.9% majority baseline.
+
+**logreg_all, also without `CODE_GENDER`, is kept as the interpretable
+benchmark.** It gives up less than 0.01 AUC, and each coefficient has a direction and size that can be read and challenged, which the model card needs so that it can: explain why an applicant scored as risky, and to check how much the model leans on age and education, the proxies that remain. XGBoost's gain ranking shows what it uses, not in which direction. 
+
+
+## Cross-validation vs Kaggle
+
+| Model | CV AUC (comparison folds) | Kaggle public AUC | Kaggle private AUC |
+| --- | --- | --- | --- |
+| Tuned XGBoost, `r best_trees` trees, no `CODE_GENDER` | `r number(cv_auc(nogender_fits$xgb_tuned), accuracy = 0.0001)` | 0.7561 | 0.7582 |
+
+Private score was 0.7582, which is above the corss validation estimate. This is
+most likely because the final model trained on all rows while each CV fit saw. So
+CV understated full data performance while remaining a fair basis for comparing models on equal terms. The 'CREDIT_TERM' drift between train and test didn't visibly hurt the overall score. 

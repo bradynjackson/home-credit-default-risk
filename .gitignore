@@ -57,3 +57,14 @@ data/
 
 # macOS
 .DS_Store
+
+# Model artifacts (includes the data/prepared.rds prep cache)
+*.rds
+models/
+
+# Kaggle submission files
+submissions/
+submission*.csv
+
+# Quarto render support folders
+*_files/
