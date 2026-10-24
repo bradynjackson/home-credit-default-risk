@@ -1,0 +1,767 @@
+---
+title: "Home Credit Default Risk: Business Impact"
+author: "Bradyn Jackson"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+    fig-width: 8
+    fig-height: 5
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(scales)
+library(knitr)
+
+# Loads tidymodels, the shared constants and the business-impact helpers
+# (section 11).
+source("modeling_functions.R")
+
+theme_set(theme_minimal(base_size = 12))
+
+model_colour     <- "#4C6EF5"
+benchmark_colour <- "#868E96"
+```
+
+# Introduction
+
+The modeling notebook chose a final model on AUC. This notebook turns that
+model into lending outcomes: how many applicants could be approved, and how
+many of them would default, compared with a simpler way of ranking
+applicants.
+
+- **The model** is the final configuration from the modeling notebook: tuned
+  XGBoost, no `CODE_GENDER`.
+- **The benchmark** is `EXT_SOURCE_MEAN`, the average of the external credit
+  scores (higher = safer). It stands in for underwriting on a bureau score
+  alone.
+
+Both are judged on **out-of-fold predictions**. Every training applicant is
+scored by a model that never saw their outcome, so each prediction is an honest
+estimate of how the model would score a new applicant.
+
+# Final model setup
+
+The final configuration is rebuilt from the modeling notebook's cached tuning,
+re-scoring and tree-count results. Nothing below refits: every line printed
+should say the result was loaded from the cache.
+
+```{r load}
+prepared <- load_prepared()
+train    <- prepared$train
+test     <- prepared$test
+
+cv_metrics <- metric_set(roc_auc, accuracy)
+
+compare_data  <- stratified_sample(train, prop = COMPARE_PROP)
+compare_folds <- make_cv_folds(compare_data)
+tune_data     <- stratified_sample(train, n = TUNE_N)
+tune_folds    <- make_cv_folds(tune_data)
+```
+
+```{r final-config}
+xgb_tune_wf <- workflow(build_recipe(tune_data), xgb_tune_spec())
+xgb_grid    <- random_tune_grid(xgb_tune_wf, tune_data, size = 20)
+xgb_tuning  <- tune_grid_cached("xgb_tuning", xgb_tune_wf, tune_folds,
+                                xgb_grid, cv_metrics)
+
+xgb_rescored <- rescore_top(xgb_tuning, xgb_tune_wf, compare_folds, cv_metrics, n = 3)
+best_config  <- map(xgb_rescored, \(f) collect_metrics(f$result)) |>
+  list_rbind(names_to = ".config") |>
+  filter(.metric == "roc_auc") |>
+  slice_max(mean, n = 1) |>
+  pull(.config)
+best_params <- show_best(xgb_tuning$result, metric = "roc_auc", n = 3) |>
+  filter(.config == best_config) |>
+  select(mtry:sample_size)
+
+trees_sweep <- sweep_trees(extract_preprocessor(xgb_tune_wf), best_params,
+                           trees = c(500, 1000, 1500, 2000),
+                           folds = compare_folds, metrics = cv_metrics)
+best_trees  <- pick_trees(trees_sweep)
+
+final_exclude <- "CODE_GENDER"
+final_wf <- finalize_workflow(
+  workflow(build_recipe(train, exclude = final_exclude),
+           xgb_tune_spec(trees = best_trees)),
+  best_params)
+
+final     <- fit_final_cached("xgb_tuned_final_nogender", final_wf, train)
+final_fit <- final$result
+```
+
+The rebuilt configuration should match the saved final model exactly:
+
+```{r config-check}
+saved_args <- map(extract_spec_parsnip(final_fit)$args, rlang::eval_tidy)
+
+config_check <- tibble(
+  parameter = c(names(best_params), "trees"),
+  rebuilt   = c(map_dbl(best_params, as.numeric), best_trees),
+  saved     = map_dbl(parameter, \(p) as.numeric(saved_args[[p]]))
+) |>
+  mutate(match = rebuilt == saved)
+
+stopifnot(all(config_check$match))
+config_check |> kable(digits = 6)
+```
+
+# Out-of-fold predictions
+
+All 307,511 training rows are split into 3 stratified folds with `pool = 0.05`,
+as in the modeling notebook. Each fold is predicted by the final configuration
+fit on the other two, so every applicant gets exactly one prediction from a
+model that did not train on them. Only the predictions and per-fold metrics are
+cached, to `data/cv_xgb_final_oof.rds`.
+
+```{r oof}
+full_folds <- make_cv_folds(train)
+
+oof <- oof_predictions_cached("xgb_final_oof", final_wf, full_folds, cv_metrics)
+```
+
+The raw loan amount is read from the original CSV. The prepared data caps
+`AMT_CREDIT` at the 99th percentile
+(`r comma(prepared$params$money_caps[["AMT_CREDIT"]])`), which would understate
+the credit held by the largest defaulted loans.
+
+```{r scored}
+prep_env  <- new.env()
+source("data_preparation.R", local = prep_env)
+raw_train <- prep_env$read_application("data/application_train.csv")
+stopifnot(identical(raw_train$SK_ID_CURR, train$SK_ID_CURR))
+
+scored <- oof$result$predictions |>
+  arrange(.row) |>
+  transmute(fold         = id,
+            SK_ID_CURR   = train$SK_ID_CURR[.row],
+            TARGET,
+            default      = TARGET == "1",
+            model_risk   = .pred_1,
+            ext_source   = train$EXT_SOURCE_MEAN[.row],
+            credit       = raw_train$AMT_CREDIT[.row])
+
+n_applicants <- nrow(scored)
+per_100k     <- 1e5 / n_applicants
+```
+
+Each fold should cover a third of the rows at the full default rate, every row
+should be predicted once, and the mean predicted default should match the
+actual rate in every fold:
+
+```{r oof-check}
+stopifnot(n_applicants == nrow(train),
+          n_distinct(scored$SK_ID_CURR) == nrow(train),
+          identical(scored$TARGET, train$TARGET))
+
+oof_auc <- oof$result$per_fold |> filter(.metric == "roc_auc") |> select(fold = id, auc = .estimate)
+
+scored |>
+  group_by(fold) |>
+  summarise(rows                   = n(),
+            default_rate           = mean(default),
+            mean_predicted_default = mean(model_risk),
+            .groups = "drop") |>
+  left_join(oof_auc, by = "fold") |>
+  mutate(across(c(default_rate, mean_predicted_default), \(x) percent(x, accuracy = 0.01))) |>
+  kable(digits = 4, format.args = list(big.mark = ","))
+```
+
+Both scores ranked against the same outcomes, on all rows:
+
+```{r auc}
+score_auc <- tibble(
+  score = c("Model (out-of-fold)", "Benchmark (EXT_SOURCE_MEAN)"),
+  auc   = c(roc_auc_vec(scored$TARGET, scored$model_risk),
+            roc_auc_vec(scored$TARGET, -scored$ext_source))
+)
+score_auc |> kable(digits = 4)
+```
+
+The out-of-fold AUC of
+`r number(score_auc$auc[1], accuracy = 0.001)` is above the 0.748 measured on
+the 20% comparison folds and close to the Kaggle private score (0.758): each
+fold model here trains on 205,000 rows rather than 41,000. The benchmark's
+`r number(score_auc$auc[2], accuracy = 0.001)` is the bar the model has to
+clear to be worth more than the external scores alone.
+
+`r comma(sum(duplicated(scored$ext_source) | duplicated(scored$ext_source, fromLast = TRUE)))`
+applicants share an `EXT_SOURCE_MEAN` value with someone else, including
+`r sum(train$EXT_SOURCE_COUNT == 0)` with no external score at all, who all
+carry the imputed median. Ties are approved in row order.
+
+# Approval tradeoff
+
+Both scores rank every applicant from lowest to highest risk, and the
+lowest-risk applicants are approved first. At each approval rate from 50% to
+100%, the default rate among those approved:
+
+```{r approval-paths}
+model_path     <- approval_path(scored$model_risk, scored$default, scored$credit)
+benchmark_path <- approval_path(-scored$ext_source, scored$default, scored$credit)
+
+approval_rates <- seq(0.50, 1.00, by = 0.01)
+curve_rows     <- round(approval_rates * n_applicants)
+
+approval_curve <- bind_rows(
+  Model     = model_path[curve_rows, ],
+  Benchmark = benchmark_path[curve_rows, ],
+  .id = "score") |>
+  mutate(approval_rate = rep(approval_rates, 2),
+         score         = factor(score, levels = c("Model", "Benchmark")))
+```
+
+```{r approval-chart}
+#| fig-height: 5.5
+# Direct labels at 60%: the model's below its line, the benchmark's above.
+curve_labels <- approval_curve |>
+  filter(approval_rate == 0.60) |>
+  mutate(label = as.character(score),
+         default_rate = default_rate + if_else(score == "Model", -0.004, 0.005))
+
+ggplot(approval_curve, aes(approval_rate, default_rate, colour = score)) +
+  geom_hline(yintercept = mean(scored$default), colour = "grey80", linewidth = 0.4) +
+  geom_line(linewidth = 1) +
+  geom_text(data = curve_labels, aes(label = label),
+            hjust = 0.5, size = 3.8, colour = "grey20", show.legend = FALSE) +
+  annotate("text", x = 0.5, y = mean(scored$default), vjust = -0.5, hjust = 0,
+           size = 3.4, colour = "grey45",
+           label = paste("Approve everyone:", percent(mean(scored$default), accuracy = 0.01))) +
+  scale_colour_manual(values = c(Model = model_colour, Benchmark = benchmark_colour),
+                      labels = c("Model", "Benchmark (EXT_SOURCE_MEAN)")) +
+  scale_x_continuous(labels = percent_format(accuracy = 1), breaks = seq(0.5, 1, 0.1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, NA),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title    = "At every approval rate, the model's approved applicants default less",
+    subtitle = "Default rate among approved applicants, approving the lowest-risk first",
+    x = "Share of applicants approved",
+    y = "Default rate among approved",
+    colour = NULL
+  ) +
+  theme(legend.position  = "top",
+        legend.justification = "left",
+        panel.grid.minor = element_blank())
+```
+
+```{r approval-table}
+approval_curve |>
+  filter(approval_rate %in% seq(0.5, 1, by = 0.1)) |>
+  select(score, approval_rate, default_rate) |>
+  pivot_wider(names_from = score, values_from = default_rate) |>
+  mutate(difference = Benchmark - Model,
+         across(everything(), \(x) percent(x, accuracy = 0.01))) |>
+  rename(model_default_rate = Model, benchmark_default_rate = Benchmark,
+         benchmark_minus_model = difference) |>
+  kable()
+```
+
+At 100% everyone is approved, so both curves meet at the overall default rate.
+Below that, the gap is how much better the model separates risky applicants
+from safe ones.
+
+# Same risk, more approvals
+
+A lender typically sets a risk appetite, a maximum default rate among approved
+applicants, and approves as many applicants as it can within it. For each
+target, each score approves the largest group of lowest-risk applicants whose
+default rate stays at or under the target. The path is read one applicant at a
+time, not in 1-point steps.
+
+```{r targets}
+targets <- c(0.04, 0.05, 0.06)
+
+at_targets <- map(targets, \(t) {
+  m <- at_target_rate(model_path, t)
+  b <- at_target_rate(benchmark_path, t)
+  same_size <- model_path[b$approved, ]   # the model at the benchmark's approval count
+  tibble(
+    target               = t,
+    model_approval       = m$approval_rate,
+    benchmark_approval   = b$approval_rate,
+    model_cutoff         = sort(scored$model_risk)[m$approved],
+    extra_approvals      = (m$approved - b$approved) * per_100k,
+    extra_repay          = ((m$approved - m$defaults) - (b$approved - b$defaults)) * per_100k,
+    extra_default        = (m$defaults - b$defaults) * per_100k,
+    defaults_avoided     = (b$defaults - same_size$defaults) * per_100k,
+    credit_avoided       = (b$defaulted_credit - same_size$defaulted_credit) * per_100k
+  )
+}) |>
+  list_rbind()
+```
+
+**More approvals at the same default rate**, per 100,000 applicants:
+
+```{r targets-approvals}
+at_targets |>
+  transmute(target_default_rate = percent(target, accuracy = 1),
+            model_approval_rate     = percent(model_approval, accuracy = 0.1),
+            benchmark_approval_rate = percent(benchmark_approval, accuracy = 0.1),
+            extra_approvals = comma(extra_approvals),
+            of_which_repay  = comma(extra_repay),
+            of_which_default = comma(extra_default)) |>
+  kable()
+```
+
+"Extra" is net: the model approves `extra_approvals` more applicants than the
+benchmark in total, and `of_which_repay` is how many more repaying applicants
+its approved group holds. The two groups differ in membership too, not just in
+size; each score approves some applicants the other declines.
+
+**Fewer defaults at the same approval rate.** Here the model approves exactly
+as many applicants as the benchmark does at each target. The defaults it
+avoids, and the loan amount (`AMT_CREDIT`, in the data's currency, not
+converted) those defaulted loans carried, per 100,000 applicants:
+
+```{r targets-avoided}
+at_targets |>
+  transmute(target_default_rate = percent(target, accuracy = 1),
+            approval_rate       = percent(benchmark_approval, accuracy = 0.1),
+            defaults_avoided    = comma(defaults_avoided),
+            credit_of_avoided_defaults = comma(credit_avoided)) |>
+  kable()
+```
+
+`credit_of_avoided_defaults` is the loan principal of those defaulted loans,
+not the loss. The actual loss depends on how much was repaid before default and
+what was recovered, neither of which is in the application data.
+
+## Fold check
+
+The figures above pool predictions from three fold models. Repeating the 5%
+target within each fold separately shows whether the gain holds in every third
+of the data, not just in the pooled ranking:
+
+```{r targets-by-fold}
+scored |>
+  group_split(fold) |>
+  map(\(d) {
+    m <- at_target_rate(approval_path(d$model_risk, d$default, d$credit), 0.05)
+    b <- at_target_rate(approval_path(-d$ext_source, d$default, d$credit), 0.05)
+    tibble(fold                    = d$fold[1],
+           model_approval_rate     = m$approval_rate,
+           benchmark_approval_rate = b$approval_rate,
+           extra_approvals_per_100k = (m$approved - b$approved) / nrow(d) * 1e5)
+  }) |>
+  list_rbind() |>
+  mutate(across(ends_with("rate"), \(x) percent(x, accuracy = 0.1)),
+         extra_approvals_per_100k = comma(extra_approvals_per_100k)) |>
+  kable()
+```
+
+# Translating to Home Credit's financials
+
+This section uses only the Q1 2019 figures from the Business Problem
+Statement (BPS):
+
+```{r financials}
+q1_impairment_eur <- 430e6
+q1_nii_eur        <- 889e6
+loans_eur         <- 18755e6
+cost_of_risk      <- 0.0229
+
+bps_loss_reduction    <- 0.05   # BPS target: 5% fewer losses
+bps_approval_gain_pts <- 1      # BPS target: +1 point approval rate
+
+tibble(
+  figure = c("Impairment losses, Q1 2019", "Net interest income, Q1 2019",
+             "Loans to customers", "Cost of risk",
+             "Check: impairment / loans to customers"),
+  value  = c(sprintf("EUR %sM", comma(q1_impairment_eur / 1e6)),
+             sprintf("EUR %sM", comma(q1_nii_eur / 1e6)),
+             sprintf("EUR %sM", comma(loans_eur / 1e6)),
+             percent(cost_of_risk, accuracy = 0.01),
+             percent(q1_impairment_eur / loans_eur, accuracy = 0.01))
+) |>
+  kable()
+```
+
+The 2.29% cost of risk is one quarter's impairment over the loan book, so it is
+a quarterly rate, and the basis-point changes below are on that basis.
+
+## Relative reduction in defaults
+
+At the 5% target, the benchmark approves
+`r percent(at_targets$benchmark_approval[at_targets$target == 0.05], accuracy = 0.1)`
+of applicants. The model approves the same number, and the reduction is the
+defaults it avoids as a share of the defaults among the benchmark's approved
+applicants, measured by count and by defaulted `AMT_CREDIT`:
+
+```{r reduction}
+bench_5 <- at_target_rate(benchmark_path, 0.05)
+model_5 <- model_path[bench_5$approved, ]   # the model at the benchmark's approval count
+
+reduction <- tibble(
+  measure   = c("Default count", "Defaulted AMT_CREDIT"),
+  benchmark = c(bench_5$defaults, bench_5$defaulted_credit),
+  model     = c(model_5$defaults, model_5$defaulted_credit)
+) |>
+  mutate(avoided  = benchmark - model,
+         relative_reduction = avoided / benchmark)
+
+reduction |>
+  mutate(across(c(benchmark, model, avoided), comma),
+         relative_reduction = percent(relative_reduction, accuracy = 0.1)) |>
+  kable(caption = sprintf("All %s training applicants; %s approved by each score",
+                          comma(n_applicants), comma(bench_5$approved)))
+
+count_reduction  <- reduction$relative_reduction[reduction$measure == "Default count"]
+credit_reduction <- reduction$relative_reduction[reduction$measure == "Defaulted AMT_CREDIT"]
+```
+
+## Impairment and cost of risk
+
+The `AMT_CREDIT`-based reduction is applied to impairment losses (annualised
+as four times Q1) and to the cost of risk. Impairment is measured in money, so
+the share of defaulted credit avoided is the closer match to it than the share
+of defaults:
+
+```{r impairment}
+annual_impairment <- 4 * q1_impairment_eur
+
+impact <- function(r) {
+  tibble(loss_reduction         = r,
+         annual_saving_eur      = annual_impairment * r,
+         new_cost_of_risk       = cost_of_risk * (1 - r),
+         cost_of_risk_change_bp = -cost_of_risk * r * 1e4)
+}
+
+impact(credit_reduction) |>
+  transmute(loss_reduction         = percent(loss_reduction, accuracy = 0.1),
+            annual_impairment      = sprintf("EUR %sM", comma(annual_impairment / 1e6)),
+            annual_saving          = sprintf("EUR %sM", comma(annual_saving_eur / 1e6)),
+            cost_of_risk           = percent(cost_of_risk, accuracy = 0.01),
+            new_cost_of_risk       = percent(new_cost_of_risk, accuracy = 0.01),
+            change_bp              = number(cost_of_risk_change_bp, accuracy = 0.1)) |>
+  kable()
+```
+
+Note: applying the count-based reduction
+(`r percent(count_reduction, accuracy = 0.1)`) instead would give an annual
+saving of EUR `r comma(impact(count_reduction)$annual_saving_eur / 1e6)`M and a
+cost of risk of
+`r percent(impact(count_reduction)$new_cost_of_risk, accuracy = 0.01)`
+(`r number(impact(count_reduction)$cost_of_risk_change_bp, accuracy = 0.1)` bp).
+
+## Scenarios
+
+The conservative case is the BPS target, a 5% loss reduction. The upper bound
+is the model's full reduction in defaulted `AMT_CREDIT` against the benchmark.
+The last column is the
+share of the model's edge over the benchmark that the conservative case needs.
+
+```{r scenarios}
+bind_rows(
+  impact(bps_loss_reduction) |> mutate(scenario = "Conservative (BPS target)"),
+  impact(credit_reduction)   |> mutate(scenario = "Upper bound (full reduction vs benchmark)")
+) |>
+  transmute(scenario,
+            share_of_model_edge = percent(loss_reduction / credit_reduction, accuracy = 1),
+            loss_reduction   = percent(loss_reduction, accuracy = 0.1),
+            annual_saving    = sprintf("EUR %sM", comma(annual_saving_eur / 1e6)),
+            new_cost_of_risk = percent(new_cost_of_risk, accuracy = 0.01),
+            change_bp        = number(cost_of_risk_change_bp, accuracy = 0.1)) |>
+  relocate(share_of_model_edge, .after = last_col()) |>
+  kable()
+```
+
+The conservative case needs
+`r percent(bps_loss_reduction / credit_reduction, accuracy = 1)` of the
+reduction the model shows against the benchmark.
+
+Note: on the count-based reduction, the upper bound would be EUR
+`r comma(impact(count_reduction)$annual_saving_eur / 1e6)`M a year, and the
+conservative case would need
+`r percent(bps_loss_reduction / count_reduction, accuracy = 1)` of the model's
+edge.
+
+## Approval rate
+
+```{r approval-gain}
+model_at_5 <- at_targets |> filter(target == 0.05)
+approval_gain_pts <- (model_at_5$model_approval - model_at_5$benchmark_approval) * 100
+
+tibble(
+  measure = c("Model approval rate at 5% target", "Benchmark approval rate at 5% target",
+              "Gain (percentage points)", "BPS target (percentage points)"),
+  value   = c(percent(model_at_5$model_approval, accuracy = 0.1),
+              percent(model_at_5$benchmark_approval, accuracy = 0.1),
+              sprintf("+%.1f", approval_gain_pts),
+              sprintf("+%.1f", bps_approval_gain_pts))
+) |>
+  kable()
+```
+
+## Assumptions
+
+- **Losses scale with defaulted credit.** Impairment is assumed to fall in
+  proportion to the `AMT_CREDIT` of defaulted loans
+  (`r percent(credit_reduction, accuracy = 0.1)`; by count it is
+  `r percent(count_reduction, accuracy = 0.1)`). Actual losses also depend on
+  how much was repaid before default, recoveries and timing, which the data
+  does not hold.
+- **`TARGET` means payment difficulty**, not necessarily a loss: some flagged
+  loans recover in full.
+- **Per-100,000 results scale proportionally** to Home Credit's whole book,
+  which assumes its applicants look like the training data.
+- **The benchmark stands in for the current process.** Home Credit already
+  uses machine learning in underwriting, so its current process is stronger
+  than `EXT_SOURCE_MEAN` alone, and the upper bound overstates the gain.
+
+# Personas
+
+Two fictional applicants make the numbers concrete. Both start from the
+**median applicant**: the median of every numeric application field and the
+most common value of every categorical one, over all training applicants. Fields
+missing for more than half of applicants (such as `EXT_SOURCE_1` and
+`OWN_CAR_AGE`) are left missing, as they would be for a typical applicant. The
+employment length median excludes the 365,243 placeholder. The personas pass
+through the same `apply_prep()` as the real data, so every engineered feature
+is consistent with the fields changed.
+
+```{r median-applicant}
+mode_of <- \(x) names(which.max(table(x)))
+
+median_applicant <- raw_train |>
+  select(-TARGET) |>
+  mutate(DAYS_EMPLOYED = na_if(DAYS_EMPLOYED, 365243)) |>
+  summarise(across(everything(), \(x)
+    if (mean(is.na(x)) > 0.5) x[NA_integer_][1]
+    else if (is.numeric(x)) median(x, na.rm = TRUE)
+    else mode_of(x))) |>
+  mutate(SK_ID_CURR = 0)
+```
+
+Each persona changes five things, all features the final model ranks highly:
+the external scores (`EXT_SOURCE_MEAN`, `_MIN`, `_MAX`, `_3`), age
+(`DAYS_BIRTH`), time employed (`EMPLOYED_AGE_RATIO`, `DAYS_EMPLOYED`), time
+since the phone number changed (`DAYS_LAST_PHONE_CHANGE`) and the loan relative
+to the goods price (`CREDIT_GOODS_RATIO`). The loan amount, income and payment
+stay at the median.
+
+```{r personas}
+years <- \(y) -round(y * 365.25)
+
+personas_raw <- bind_rows(
+  "Median applicant" = median_applicant,
+  Jane = median_applicant |>
+    mutate(SK_ID_CURR = 1,
+           EXT_SOURCE_2 = 0.70, EXT_SOURCE_3 = 0.70,
+           DAYS_BIRTH = years(50), DAYS_EMPLOYED = years(12),
+           DAYS_LAST_PHONE_CHANGE = years(5),
+           AMT_GOODS_PRICE = AMT_CREDIT),
+  Marcus = median_applicant |>
+    mutate(SK_ID_CURR = 2,
+           EXT_SOURCE_2 = 0.25, EXT_SOURCE_3 = 0.25,
+           DAYS_BIRTH = years(26), DAYS_EMPLOYED = years(1),
+           DAYS_LAST_PHONE_CHANGE = years(2 / 12),
+           AMT_GOODS_PRICE = round(AMT_CREDIT / 1.25)),
+  .id = "persona")
+
+personas <- prep_env$apply_prep(select(personas_raw, -persona), prepared$params)
+stopifnot(setequal(names(personas), setdiff(names(train), "TARGET")))
+```
+
+Each changed value, with the share of training applicants at or below it, a
+check that each is a value real applicants hold:
+
+```{r persona-profile}
+real <- raw_train |>
+  transmute(ext_2   = EXT_SOURCE_2,
+            ext_3   = EXT_SOURCE_3,
+            age     = -DAYS_BIRTH / 365.25,
+            employed = -na_if(DAYS_EMPLOYED, 365243) / 365.25,
+            phone   = -DAYS_LAST_PHONE_CHANGE / 365.25,
+            credit_goods = AMT_CREDIT / AMT_GOODS_PRICE)
+
+persona_values <- personas_raw |>
+  transmute(persona,
+            ext_2   = EXT_SOURCE_2,
+            ext_3   = EXT_SOURCE_3,
+            age     = -DAYS_BIRTH / 365.25,
+            employed = -DAYS_EMPLOYED / 365.25,
+            phone   = -DAYS_LAST_PHONE_CHANGE / 365.25,
+            credit_goods = AMT_CREDIT / AMT_GOODS_PRICE)
+
+field_labels <- c(ext_2 = "External score 2", ext_3 = "External score 3",
+                  age = "Age (years)", employed = "Years in current job",
+                  phone = "Years since phone number changed",
+                  credit_goods = "Loan / price of goods")
+
+persona_values |>
+  pivot_longer(-persona, names_to = "field") |>
+  mutate(percentile = map2_dbl(field, value, \(f, v) mean(real[[f]] <= v, na.rm = TRUE)),
+         shown = sprintf("%s (%s)", number(value, accuracy = 0.01), percent(percentile, accuracy = 1)),
+         field = field_labels[field]) |>
+  select(field, persona, shown) |>
+  pivot_wider(names_from = persona, values_from = shown) |>
+  kable(caption = "Value (share of training applicants at or below it)")
+```
+
+## Scores
+
+The personas are scored by the final model fit on all training rows, while the
+cutoffs above come from out-of-fold predictions. The two are on the same scale
+if the final model's predictions for new applicants (the test set) are spread
+like the out-of-fold ones:
+
+```{r scale-check}
+test_risk <- predict(final_fit, test, type = "prob")$.pred_1
+probs     <- c(0.10, 0.25, 0.50, 0.75, 0.90)
+
+rbind(`Out-of-fold (train)` = quantile(scored$model_risk, probs),
+      `Final model (test)`  = quantile(test_risk, probs)) |>
+  kable(digits = 4)
+```
+
+```{r persona-scores}
+cutoff_5 <- at_targets$model_cutoff[at_targets$target == 0.05]
+
+persona_scores <- tibble(
+  persona = personas_raw$persona,
+  predicted_default = predict(final_fit, personas, type = "prob")$.pred_1
+) |>
+  mutate(cutoff_at_5pct_target = cutoff_5,
+         decision = if_else(predicted_default <= cutoff_5, "Approve", "Decline"))
+
+persona_scores |>
+  mutate(across(c(predicted_default, cutoff_at_5pct_target), \(x) percent(x, accuracy = 0.1))) |>
+  kable()
+```
+
+At the 5% target the model approves applicants with a predicted default
+probability up to `r percent(cutoff_5, accuracy = 0.1)`. The marginal applicant
+carries far more risk than the 5% average, because the approved group is
+mostly much safer applicants. The median applicant sits close to that line.
+
+## Why: top 5 factors
+
+`predcontrib = TRUE` splits each persona's prediction into one contribution per
+feature, on the log-odds scale. The contributions add to the persona's
+predicted log-odds of default, starting from the model's baseline for an
+average applicant. `xgb_contributions()` checks that sum against the model's
+own prediction before returning anything.
+
+Several features encode the same input: age appears as `DAYS_BIRTH`,
+`AGE_YEARS` and `AGE_BAND`; the external scores as each score plus their mean,
+minimum, maximum and count; categories as one dummy per level. Their
+contributions are added together, so each row below is one thing about the
+applicant.
+
+```{r contributions}
+factor_cols <- names(select(train, where(is.factor), -TARGET))
+
+feature_group <- function(feature) {
+  base <- map_chr(feature, \(f) {
+    hit <- factor_cols[str_starts(f, paste0(factor_cols, "_"))]
+    if (length(hit) > 0) hit[which.max(nchar(hit))] else f
+  })
+  case_when(
+    str_detect(base, "^(FLAG_MISSING_)?EXT_SOURCE")       ~ "External credit scores",
+    str_detect(base, "^(DAYS_BIRTH|AGE_YEARS|AGE_BAND)") ~ "Age",
+    base %in% c("DAYS_EMPLOYED", "YEARS_EMPLOYED")       ~ "Years in current job",
+    base == "EMPLOYED_AGE_RATIO"                          ~ "Share of life spent in current job",
+    base == "DAYS_LAST_PHONE_CHANGE"                      ~ "Time since phone number changed",
+    base %in% c("DAYS_ID_PUBLISH", "YEARS_ID_PUBLISHED") ~ "Time since ID document issued",
+    base %in% c("DAYS_REGISTRATION", "YEARS_REGISTERED") ~ "Time since registration changed",
+    base == "CREDIT_GOODS_RATIO"                          ~ "Loan relative to price of goods",
+    base == "CREDIT_TERM"                                 ~ "Payment relative to loan (implied term)",
+    base == "CREDIT_INCOME_RATIO"                         ~ "Loan relative to income",
+    base == "ANNUITY_INCOME_RATIO"                        ~ "Payment relative to income",
+    base == "AMT_GOODS_PRICE"                             ~ "Price of goods financed",
+    base == "AMT_ANNUITY"                                 ~ "Payment amount",
+    base == "AMT_CREDIT"                                  ~ "Loan amount",
+    base == "NAME_EDUCATION_TYPE"                         ~ "Education level",
+    base == "REGION_POPULATION_RELATIVE"                  ~ "Population of home region",
+    TRUE                                                  ~ base
+  )
+}
+
+contributions <- xgb_contributions(final_fit, personas) |>
+  mutate(persona = personas_raw$persona[.row])
+
+baseline_log_odds <- contributions |>
+  filter(feature == "BIAS") |>
+  pull(contribution) |>
+  unique()
+
+grouped <- contributions |>
+  filter(feature != "BIAS") |>
+  mutate(factor = feature_group(feature)) |>
+  group_by(persona, factor) |>
+  summarise(contribution = sum(contribution), .groups = "drop")
+```
+
+The baseline is `r number(baseline_log_odds, accuracy = 0.01)` log-odds, a
+`r percent(plogis(baseline_log_odds), accuracy = 0.1)` default probability.
+
+```{r top-factors}
+#| results: asis
+for (who in c("Jane", "Marcus")) {
+  score <- persona_scores$predicted_default[persona_scores$persona == who]
+  cat(sprintf("\n**%s**: predicted default %s (%s at the 5%% target)\n\n",
+              who, percent(score, accuracy = 0.1),
+              persona_scores$decision[persona_scores$persona == who]))
+  grouped |>
+    filter(persona == who) |>
+    slice_max(abs(contribution), n = 5) |>
+    transmute(rank   = row_number(),
+              factor,
+              effect = if_else(contribution > 0, "pushes risk up", "pushes risk down"),
+              log_odds = contribution) |>
+    kable(digits = 2) |>
+    print()
+  cat("\n")
+}
+```
+
+A contribution is measured against the baseline applicant, not against the
+median applicant the personas started from, so an unchanged feature can still
+appear in the list.
+
+Marcus's age pushes his risk *down*, although default falls with age overall
+in the EDA. That is what the data show once the external scores are known:
+among applicants with external scores as low as his, younger applicants
+default no more often than middle-aged ones, so the youth effect seen overall
+is already carried by the scores.
+
+```{r age-check}
+marcus_ext <- personas$EXT_SOURCE_MEAN[personas_raw$persona == "Marcus"]
+
+train |>
+  mutate(group = if_else(EXT_SOURCE_MEAN <= 0.35, "low_ext_score", "other")) |>
+  group_by(AGE_BAND) |>
+  summarise(all_applicants        = mean(TARGET == "1"),
+            low_ext_score_default = mean(TARGET[group == "low_ext_score"] == "1"),
+            low_ext_score_rows    = sum(group == "low_ext_score"),
+            .groups = "drop") |>
+  mutate(across(c(all_applicants, low_ext_score_default), \(x) percent(x, accuracy = 0.1))) |>
+  kable(format.args = list(big.mark = ","),
+        caption = sprintf("Default rate by age band; low external score = EXT_SOURCE_MEAN at or below 0.35 (Marcus: %.2f)",
+                          marcus_ext))
+```
+
+# Limitations
+
+- **Approved applicants only.** The training data holds only applicants Home
+  Credit approved; those it declined, and how they would have repaid, are not
+  in it (no reject inference). The approval rates here re-rank the applicants
+  Home Credit already approved. They do not show what would happen to
+  applicants it declined, who are likely riskier.
+- **The benchmark is a stand-in.** `EXT_SOURCE_MEAN` represents underwriting on
+  external scores alone. It is not Home Credit's actual approval policy, which
+  is not in the data, so the gains above are measured against this stand-in,
+  not against the current process.
+- **`TARGET` marks payment difficulties**, not necessarily a written-off loan,
+  and `AMT_CREDIT` is principal, not loss.

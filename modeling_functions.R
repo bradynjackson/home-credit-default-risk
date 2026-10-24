@@ -609,3 +609,81 @@ validate_submission <- function(submission, test) {
   }
   checks
 }
+
+
+# 11. Business impact ---------------------------------------------------------
+# Used by business_impact.qmd. Every number there comes from out-of-fold
+# predictions: each applicant is scored by a model that never saw their
+# outcome, as a new applicant would be.
+
+#' Out-of-fold predicted default probabilities for every row the folds cover.
+#' Cached like the other fits, but only the predictions and per-fold metrics
+#' are kept: a full resampling object also stores a copy of every training
+#' row, and here that is all 307,511.
+oof_predictions_cached <- function(name, workflow, folds, metrics,
+                                   dir = "data", refit = FALSE, seed = MODEL_SEED) {
+  run_cached(name, dir = dir, refit = refit, run = \() {
+    res <- withr::with_seed(seed, fit_resamples(
+      workflow, folds, metrics = metrics,
+      control = control_resamples(save_pred = TRUE)))
+    list(predictions = collect_predictions(res) |> select(id, .row, .pred_1, TARGET),
+         per_fold    = collect_metrics(res, summarize = FALSE))
+  })
+}
+
+#' The portfolio at every approval count: approve the k lowest-risk applicants,
+#' for k = 1..n. `risk` is any score where higher means riskier (pass
+#' -EXT_SOURCE_MEAN for a score where higher means safer). order() is stable,
+#' so tied scores are approved in row order.
+#' `credit` is each applicant's loan amount; defaulted_credit is the total
+#' credit held by the defaulters among those approved.
+approval_path <- function(risk, default, credit) {
+  o <- order(risk)
+  tibble(approved         = seq_along(o),
+         approval_rate    = approved / length(o),
+         defaults         = cumsum(default[o]),
+         default_rate     = defaults / approved,
+         defaulted_credit = cumsum(credit[o] * default[o]))
+}
+
+#' The largest portfolio whose default rate stays at or under `target`.
+#' Reads the path at single-applicant resolution, not in 1-point steps.
+at_target_rate <- function(path, target) {
+  path[max(which(path$default_rate <= target)), ]
+}
+
+#' Per-feature contributions to each row's predicted log-odds of default,
+#' from xgboost's predcontrib = TRUE (SHAP values). Rows are baked through the
+#' fitted recipe, so features are post-recipe (dummies included). BIAS is the
+#' model's baseline log-odds; BIAS plus every contribution is the row's
+#' log-odds, which is checked against the workflow's own predicted
+#' probability before anything is returned.
+#' The matrix is built the way parsnip builds it for fitting and predicting:
+#' step_dummy() returns sparse columns, so parsnip hands xgboost a sparse
+#' matrix, where every zero counts as missing. A dense matrix gives different
+#' predictions from the same booster.
+#' Signs are flipped if needed so a positive contribution always pushes
+#' toward default, whichever class the booster treats as positive.
+xgb_contributions <- function(fitted, new_data) {
+  booster <- extract_fit_engine(fitted)
+  baked   <- bake(extract_recipe(fitted), new_data, all_predictors())
+  baked   <- baked[, variable.names(booster)]
+  x <- if (sparsevctrs::has_sparse_elements(baked)) {
+    sparsevctrs::coerce_to_sparse_matrix(baked)
+  } else {
+    as.matrix(baked)
+  }
+  contrib <- predict(booster, xgboost::xgb.DMatrix(x, missing = NA), predcontrib = TRUE)
+
+  p_booster <- plogis(rowSums(contrib))
+  p_default <- predict(fitted, new_data, type = "prob")$.pred_1
+  sign <- if (isTRUE(all.equal(p_booster, p_default, tolerance = 1e-5))) 1
+          else if (isTRUE(all.equal(1 - p_booster, p_default, tolerance = 1e-5))) -1
+          else stop("Contributions do not reproduce the predicted probabilities.")
+
+  # xgboost 3 names the baseline column "(Intercept)"; earlier versions "BIAS".
+  as_tibble(sign * contrib) |>
+    mutate(.row = seq_len(n()), .before = 1) |>
+    pivot_longer(-.row, names_to = "feature", values_to = "contribution") |>
+    mutate(feature = if_else(feature %in% c("(Intercept)", "BIAS"), "BIAS", feature))
+}
