@@ -7,7 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
 <meta name="author" content="Bradyn Jackson">
-<meta name="dcterms.date" content="2026-10-14">
+<meta name="dcterms.date" content="2026-10-23">
 
 <title>Home Credit Default Risk: Business Impact</title>
 <style>
@@ -2260,7 +2260,7 @@ vertical-align: -.125em;
     <div>
     <div class="quarto-title-meta-heading">Published</div>
     <div class="quarto-title-meta-contents">
-      <p class="date">October 14, 2026</p>
+      <p class="date">October 23, 2026</p>
     </div>
   </div>
   
@@ -3466,45 +3466,19 @@ Loaded cached result for xgb_trees_2000 from data/cv_xgb_trees_2000.rds (fit 202
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb36"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a>factor_cols <span class="ot">&lt;-</span> <span class="fu">names</span>(<span class="fu">select</span>(train, <span class="fu">where</span>(is.factor), <span class="sc">-</span>TARGET))</span>
 <span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a>feature_group <span class="ot">&lt;-</span> <span class="cf">function</span>(feature) {</span>
-<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a>  base <span class="ot">&lt;-</span> <span class="fu">map_chr</span>(feature, \(f) {</span>
-<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a>    hit <span class="ot">&lt;-</span> factor_cols[<span class="fu">str_starts</span>(f, <span class="fu">paste0</span>(factor_cols, <span class="st">&quot;_&quot;</span>))]</span>
-<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">length</span>(hit) <span class="sc">&gt;</span> <span class="dv">0</span>) hit[<span class="fu">which.max</span>(<span class="fu">nchar</span>(hit))] <span class="cf">else</span> f</span>
-<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a>  })</span>
-<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">case_when</span>(</span>
-<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">str_detect</span>(base, <span class="st">&quot;^(FLAG_MISSING_)?EXT_SOURCE&quot;</span>)       <span class="sc">~</span> <span class="st">&quot;External credit scores&quot;</span>,</span>
-<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a>    <span class="fu">str_detect</span>(base, <span class="st">&quot;^(DAYS_BIRTH|AGE_YEARS|AGE_BAND)&quot;</span>) <span class="sc">~</span> <span class="st">&quot;Age&quot;</span>,</span>
-<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">&quot;DAYS_EMPLOYED&quot;</span>, <span class="st">&quot;YEARS_EMPLOYED&quot;</span>)       <span class="sc">~</span> <span class="st">&quot;Years in current job&quot;</span>,</span>
-<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;EMPLOYED_AGE_RATIO&quot;</span>                          <span class="sc">~</span> <span class="st">&quot;Share of life spent in current job&quot;</span>,</span>
-<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;DAYS_LAST_PHONE_CHANGE&quot;</span>                      <span class="sc">~</span> <span class="st">&quot;Time since phone number changed&quot;</span>,</span>
-<span id="cb36-14"><a href="#cb36-14" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">&quot;DAYS_ID_PUBLISH&quot;</span>, <span class="st">&quot;YEARS_ID_PUBLISHED&quot;</span>) <span class="sc">~</span> <span class="st">&quot;Time since ID document issued&quot;</span>,</span>
-<span id="cb36-15"><a href="#cb36-15" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">&quot;DAYS_REGISTRATION&quot;</span>, <span class="st">&quot;YEARS_REGISTERED&quot;</span>) <span class="sc">~</span> <span class="st">&quot;Time since registration changed&quot;</span>,</span>
-<span id="cb36-16"><a href="#cb36-16" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;CREDIT_GOODS_RATIO&quot;</span>                          <span class="sc">~</span> <span class="st">&quot;Loan relative to price of goods&quot;</span>,</span>
-<span id="cb36-17"><a href="#cb36-17" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;CREDIT_TERM&quot;</span>                                 <span class="sc">~</span> <span class="st">&quot;Payment relative to loan (implied term)&quot;</span>,</span>
-<span id="cb36-18"><a href="#cb36-18" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;CREDIT_INCOME_RATIO&quot;</span>                         <span class="sc">~</span> <span class="st">&quot;Loan relative to income&quot;</span>,</span>
-<span id="cb36-19"><a href="#cb36-19" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;ANNUITY_INCOME_RATIO&quot;</span>                        <span class="sc">~</span> <span class="st">&quot;Payment relative to income&quot;</span>,</span>
-<span id="cb36-20"><a href="#cb36-20" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;AMT_GOODS_PRICE&quot;</span>                             <span class="sc">~</span> <span class="st">&quot;Price of goods financed&quot;</span>,</span>
-<span id="cb36-21"><a href="#cb36-21" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;AMT_ANNUITY&quot;</span>                                 <span class="sc">~</span> <span class="st">&quot;Payment amount&quot;</span>,</span>
-<span id="cb36-22"><a href="#cb36-22" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;AMT_CREDIT&quot;</span>                                  <span class="sc">~</span> <span class="st">&quot;Loan amount&quot;</span>,</span>
-<span id="cb36-23"><a href="#cb36-23" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;NAME_EDUCATION_TYPE&quot;</span>                         <span class="sc">~</span> <span class="st">&quot;Education level&quot;</span>,</span>
-<span id="cb36-24"><a href="#cb36-24" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;REGION_POPULATION_RELATIVE&quot;</span>                  <span class="sc">~</span> <span class="st">&quot;Population of home region&quot;</span>,</span>
-<span id="cb36-25"><a href="#cb36-25" aria-hidden="true" tabindex="-1"></a>    <span class="cn">TRUE</span>                                                  <span class="sc">~</span> base</span>
-<span id="cb36-26"><a href="#cb36-26" aria-hidden="true" tabindex="-1"></a>  )</span>
-<span id="cb36-27"><a href="#cb36-27" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb36-28"><a href="#cb36-28" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb36-29"><a href="#cb36-29" aria-hidden="true" tabindex="-1"></a>contributions <span class="ot">&lt;-</span> <span class="fu">xgb_contributions</span>(final_fit, personas) <span class="sc">|&gt;</span></span>
-<span id="cb36-30"><a href="#cb36-30" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">persona =</span> personas_raw<span class="sc">$</span>persona[.row])</span>
-<span id="cb36-31"><a href="#cb36-31" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb36-32"><a href="#cb36-32" aria-hidden="true" tabindex="-1"></a>baseline_log_odds <span class="ot">&lt;-</span> contributions <span class="sc">|&gt;</span></span>
-<span id="cb36-33"><a href="#cb36-33" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(feature <span class="sc">==</span> <span class="st">&quot;BIAS&quot;</span>) <span class="sc">|&gt;</span></span>
-<span id="cb36-34"><a href="#cb36-34" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pull</span>(contribution) <span class="sc">|&gt;</span></span>
-<span id="cb36-35"><a href="#cb36-35" aria-hidden="true" tabindex="-1"></a>  <span class="fu">unique</span>()</span>
-<span id="cb36-36"><a href="#cb36-36" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb36-37"><a href="#cb36-37" aria-hidden="true" tabindex="-1"></a>grouped <span class="ot">&lt;-</span> contributions <span class="sc">|&gt;</span></span>
-<span id="cb36-38"><a href="#cb36-38" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(feature <span class="sc">!=</span> <span class="st">&quot;BIAS&quot;</span>) <span class="sc">|&gt;</span></span>
-<span id="cb36-39"><a href="#cb36-39" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">factor =</span> <span class="fu">feature_group</span>(feature)) <span class="sc">|&gt;</span></span>
-<span id="cb36-40"><a href="#cb36-40" aria-hidden="true" tabindex="-1"></a>  <span class="fu">group_by</span>(persona, factor) <span class="sc">|&gt;</span></span>
-<span id="cb36-41"><a href="#cb36-41" aria-hidden="true" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">contribution =</span> <span class="fu">sum</span>(contribution), <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a>contributions <span class="ot">&lt;-</span> <span class="fu">xgb_contributions</span>(final_fit, personas) <span class="sc">|&gt;</span></span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">persona =</span> personas_raw<span class="sc">$</span>persona[.row])</span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a>baseline_log_odds <span class="ot">&lt;-</span> contributions <span class="sc">|&gt;</span></span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(feature <span class="sc">==</span> <span class="st">&quot;BIAS&quot;</span>) <span class="sc">|&gt;</span></span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pull</span>(contribution) <span class="sc">|&gt;</span></span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a>  <span class="fu">unique</span>()</span>
+<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a>grouped <span class="ot">&lt;-</span> contributions <span class="sc">|&gt;</span></span>
+<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(feature <span class="sc">!=</span> <span class="st">&quot;BIAS&quot;</span>) <span class="sc">|&gt;</span></span>
+<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">factor =</span> <span class="fu">feature_group</span>(feature, factor_cols)) <span class="sc">|&gt;</span></span>
+<span id="cb36-14"><a href="#cb36-14" aria-hidden="true" tabindex="-1"></a>  <span class="fu">group_by</span>(persona, factor) <span class="sc">|&gt;</span></span>
+<span id="cb36-15"><a href="#cb36-15" aria-hidden="true" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">contribution =</span> <span class="fu">sum</span>(contribution), <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 </div>
 <p>The baseline is -2.44 log-odds, a 8.1% default probability.</p>
@@ -4850,109 +4824,83 @@ Loaded cached result for xgb_trees_2000 from data/cv_xgb_trees_2000.rds (fit 202
 <span id="cb39-662"><a href="#cb39-662" aria-hidden="true" tabindex="-1"></a><span class="in">```{r contributions}</span></span>
 <span id="cb39-663"><a href="#cb39-663" aria-hidden="true" tabindex="-1"></a>factor_cols <span class="ot">&lt;-</span> <span class="fu">names</span>(<span class="fu">select</span>(train, <span class="fu">where</span>(is.factor), <span class="sc">-</span>TARGET))</span>
 <span id="cb39-664"><a href="#cb39-664" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-665"><a href="#cb39-665" aria-hidden="true" tabindex="-1"></a>feature_group <span class="ot">&lt;-</span> <span class="cf">function</span>(feature) {</span>
-<span id="cb39-666"><a href="#cb39-666" aria-hidden="true" tabindex="-1"></a>  base <span class="ot">&lt;-</span> <span class="fu">map_chr</span>(feature, \(f) {</span>
-<span id="cb39-667"><a href="#cb39-667" aria-hidden="true" tabindex="-1"></a>    hit <span class="ot">&lt;-</span> factor_cols[<span class="fu">str_starts</span>(f, <span class="fu">paste0</span>(factor_cols, <span class="st">&quot;_&quot;</span>))]</span>
-<span id="cb39-668"><a href="#cb39-668" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> (<span class="fu">length</span>(hit) <span class="sc">&gt;</span> <span class="dv">0</span>) hit[<span class="fu">which.max</span>(<span class="fu">nchar</span>(hit))] <span class="cf">else</span> f</span>
-<span id="cb39-669"><a href="#cb39-669" aria-hidden="true" tabindex="-1"></a>  })</span>
-<span id="cb39-670"><a href="#cb39-670" aria-hidden="true" tabindex="-1"></a>  <span class="fu">case_when</span>(</span>
-<span id="cb39-671"><a href="#cb39-671" aria-hidden="true" tabindex="-1"></a>    <span class="fu">str_detect</span>(base, <span class="st">&quot;^(FLAG_MISSING_)?EXT_SOURCE&quot;</span>)       <span class="sc">~</span> <span class="st">&quot;External credit scores&quot;</span>,</span>
-<span id="cb39-672"><a href="#cb39-672" aria-hidden="true" tabindex="-1"></a>    <span class="fu">str_detect</span>(base, <span class="st">&quot;^(DAYS_BIRTH|AGE_YEARS|AGE_BAND)&quot;</span>) <span class="sc">~</span> <span class="st">&quot;Age&quot;</span>,</span>
-<span id="cb39-673"><a href="#cb39-673" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">&quot;DAYS_EMPLOYED&quot;</span>, <span class="st">&quot;YEARS_EMPLOYED&quot;</span>)       <span class="sc">~</span> <span class="st">&quot;Years in current job&quot;</span>,</span>
-<span id="cb39-674"><a href="#cb39-674" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;EMPLOYED_AGE_RATIO&quot;</span>                          <span class="sc">~</span> <span class="st">&quot;Share of life spent in current job&quot;</span>,</span>
-<span id="cb39-675"><a href="#cb39-675" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;DAYS_LAST_PHONE_CHANGE&quot;</span>                      <span class="sc">~</span> <span class="st">&quot;Time since phone number changed&quot;</span>,</span>
-<span id="cb39-676"><a href="#cb39-676" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">&quot;DAYS_ID_PUBLISH&quot;</span>, <span class="st">&quot;YEARS_ID_PUBLISHED&quot;</span>) <span class="sc">~</span> <span class="st">&quot;Time since ID document issued&quot;</span>,</span>
-<span id="cb39-677"><a href="#cb39-677" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">%in%</span> <span class="fu">c</span>(<span class="st">&quot;DAYS_REGISTRATION&quot;</span>, <span class="st">&quot;YEARS_REGISTERED&quot;</span>) <span class="sc">~</span> <span class="st">&quot;Time since registration changed&quot;</span>,</span>
-<span id="cb39-678"><a href="#cb39-678" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;CREDIT_GOODS_RATIO&quot;</span>                          <span class="sc">~</span> <span class="st">&quot;Loan relative to price of goods&quot;</span>,</span>
-<span id="cb39-679"><a href="#cb39-679" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;CREDIT_TERM&quot;</span>                                 <span class="sc">~</span> <span class="st">&quot;Payment relative to loan (implied term)&quot;</span>,</span>
-<span id="cb39-680"><a href="#cb39-680" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;CREDIT_INCOME_RATIO&quot;</span>                         <span class="sc">~</span> <span class="st">&quot;Loan relative to income&quot;</span>,</span>
-<span id="cb39-681"><a href="#cb39-681" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;ANNUITY_INCOME_RATIO&quot;</span>                        <span class="sc">~</span> <span class="st">&quot;Payment relative to income&quot;</span>,</span>
-<span id="cb39-682"><a href="#cb39-682" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;AMT_GOODS_PRICE&quot;</span>                             <span class="sc">~</span> <span class="st">&quot;Price of goods financed&quot;</span>,</span>
-<span id="cb39-683"><a href="#cb39-683" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;AMT_ANNUITY&quot;</span>                                 <span class="sc">~</span> <span class="st">&quot;Payment amount&quot;</span>,</span>
-<span id="cb39-684"><a href="#cb39-684" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;AMT_CREDIT&quot;</span>                                  <span class="sc">~</span> <span class="st">&quot;Loan amount&quot;</span>,</span>
-<span id="cb39-685"><a href="#cb39-685" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;NAME_EDUCATION_TYPE&quot;</span>                         <span class="sc">~</span> <span class="st">&quot;Education level&quot;</span>,</span>
-<span id="cb39-686"><a href="#cb39-686" aria-hidden="true" tabindex="-1"></a>    base <span class="sc">==</span> <span class="st">&quot;REGION_POPULATION_RELATIVE&quot;</span>                  <span class="sc">~</span> <span class="st">&quot;Population of home region&quot;</span>,</span>
-<span id="cb39-687"><a href="#cb39-687" aria-hidden="true" tabindex="-1"></a>    <span class="cn">TRUE</span>                                                  <span class="sc">~</span> base</span>
-<span id="cb39-688"><a href="#cb39-688" aria-hidden="true" tabindex="-1"></a>  )</span>
-<span id="cb39-689"><a href="#cb39-689" aria-hidden="true" tabindex="-1"></a>}</span>
-<span id="cb39-690"><a href="#cb39-690" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-691"><a href="#cb39-691" aria-hidden="true" tabindex="-1"></a>contributions <span class="ot">&lt;-</span> <span class="fu">xgb_contributions</span>(final_fit, personas) <span class="sc">|&gt;</span></span>
-<span id="cb39-692"><a href="#cb39-692" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">persona =</span> personas_raw<span class="sc">$</span>persona[.row])</span>
-<span id="cb39-693"><a href="#cb39-693" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-694"><a href="#cb39-694" aria-hidden="true" tabindex="-1"></a>baseline_log_odds <span class="ot">&lt;-</span> contributions <span class="sc">|&gt;</span></span>
-<span id="cb39-695"><a href="#cb39-695" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(feature <span class="sc">==</span> <span class="st">&quot;BIAS&quot;</span>) <span class="sc">|&gt;</span></span>
-<span id="cb39-696"><a href="#cb39-696" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pull</span>(contribution) <span class="sc">|&gt;</span></span>
-<span id="cb39-697"><a href="#cb39-697" aria-hidden="true" tabindex="-1"></a>  <span class="fu">unique</span>()</span>
-<span id="cb39-698"><a href="#cb39-698" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-699"><a href="#cb39-699" aria-hidden="true" tabindex="-1"></a>grouped <span class="ot">&lt;-</span> contributions <span class="sc">|&gt;</span></span>
-<span id="cb39-700"><a href="#cb39-700" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(feature <span class="sc">!=</span> <span class="st">&quot;BIAS&quot;</span>) <span class="sc">|&gt;</span></span>
-<span id="cb39-701"><a href="#cb39-701" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">factor =</span> <span class="fu">feature_group</span>(feature)) <span class="sc">|&gt;</span></span>
-<span id="cb39-702"><a href="#cb39-702" aria-hidden="true" tabindex="-1"></a>  <span class="fu">group_by</span>(persona, factor) <span class="sc">|&gt;</span></span>
-<span id="cb39-703"><a href="#cb39-703" aria-hidden="true" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">contribution =</span> <span class="fu">sum</span>(contribution), <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>)</span>
-<span id="cb39-704"><a href="#cb39-704" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb39-705"><a href="#cb39-705" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-706"><a href="#cb39-706" aria-hidden="true" tabindex="-1"></a>The baseline is <span class="in">`r number(baseline_log_odds, accuracy = 0.01)`</span> log-odds, a</span>
-<span id="cb39-707"><a href="#cb39-707" aria-hidden="true" tabindex="-1"></a><span class="in">`r percent(plogis(baseline_log_odds), accuracy = 0.1)`</span> default probability.</span>
-<span id="cb39-708"><a href="#cb39-708" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-709"><a href="#cb39-709" aria-hidden="true" tabindex="-1"></a><span class="in">```{r top-factors}</span></span>
-<span id="cb39-710"><a href="#cb39-710" aria-hidden="true" tabindex="-1"></a><span class="co">#| results: asis</span></span>
-<span id="cb39-711"><a href="#cb39-711" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (who <span class="cf">in</span> <span class="fu">c</span>(<span class="st">&quot;Jane&quot;</span>, <span class="st">&quot;Marcus&quot;</span>)) {</span>
-<span id="cb39-712"><a href="#cb39-712" aria-hidden="true" tabindex="-1"></a>  score <span class="ot">&lt;-</span> persona_scores<span class="sc">$</span>predicted_default[persona_scores<span class="sc">$</span>persona <span class="sc">==</span> who]</span>
-<span id="cb39-713"><a href="#cb39-713" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;</span><span class="sc">\n</span><span class="st">**%s**: predicted default %s (%s at the 5%% target)</span><span class="sc">\n\n</span><span class="st">&quot;</span>,</span>
-<span id="cb39-714"><a href="#cb39-714" aria-hidden="true" tabindex="-1"></a>              who, <span class="fu">percent</span>(score, <span class="at">accuracy =</span> <span class="fl">0.1</span>),</span>
-<span id="cb39-715"><a href="#cb39-715" aria-hidden="true" tabindex="-1"></a>              persona_scores<span class="sc">$</span>decision[persona_scores<span class="sc">$</span>persona <span class="sc">==</span> who]))</span>
-<span id="cb39-716"><a href="#cb39-716" aria-hidden="true" tabindex="-1"></a>  grouped <span class="sc">|&gt;</span></span>
-<span id="cb39-717"><a href="#cb39-717" aria-hidden="true" tabindex="-1"></a>    <span class="fu">filter</span>(persona <span class="sc">==</span> who) <span class="sc">|&gt;</span></span>
-<span id="cb39-718"><a href="#cb39-718" aria-hidden="true" tabindex="-1"></a>    <span class="fu">slice_max</span>(<span class="fu">abs</span>(contribution), <span class="at">n =</span> <span class="dv">5</span>) <span class="sc">|&gt;</span></span>
-<span id="cb39-719"><a href="#cb39-719" aria-hidden="true" tabindex="-1"></a>    <span class="fu">transmute</span>(<span class="at">rank   =</span> <span class="fu">row_number</span>(),</span>
-<span id="cb39-720"><a href="#cb39-720" aria-hidden="true" tabindex="-1"></a>              factor,</span>
-<span id="cb39-721"><a href="#cb39-721" aria-hidden="true" tabindex="-1"></a>              <span class="at">effect =</span> <span class="fu">if_else</span>(contribution <span class="sc">&gt;</span> <span class="dv">0</span>, <span class="st">&quot;pushes risk up&quot;</span>, <span class="st">&quot;pushes risk down&quot;</span>),</span>
-<span id="cb39-722"><a href="#cb39-722" aria-hidden="true" tabindex="-1"></a>              <span class="at">log_odds =</span> contribution) <span class="sc">|&gt;</span></span>
-<span id="cb39-723"><a href="#cb39-723" aria-hidden="true" tabindex="-1"></a>    <span class="fu">kable</span>(<span class="at">digits =</span> <span class="dv">2</span>) <span class="sc">|&gt;</span></span>
-<span id="cb39-724"><a href="#cb39-724" aria-hidden="true" tabindex="-1"></a>    <span class="fu">print</span>()</span>
-<span id="cb39-725"><a href="#cb39-725" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
-<span id="cb39-726"><a href="#cb39-726" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb39-665"><a href="#cb39-665" aria-hidden="true" tabindex="-1"></a>contributions <span class="ot">&lt;-</span> <span class="fu">xgb_contributions</span>(final_fit, personas) <span class="sc">|&gt;</span></span>
+<span id="cb39-666"><a href="#cb39-666" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">persona =</span> personas_raw<span class="sc">$</span>persona[.row])</span>
+<span id="cb39-667"><a href="#cb39-667" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-668"><a href="#cb39-668" aria-hidden="true" tabindex="-1"></a>baseline_log_odds <span class="ot">&lt;-</span> contributions <span class="sc">|&gt;</span></span>
+<span id="cb39-669"><a href="#cb39-669" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(feature <span class="sc">==</span> <span class="st">&quot;BIAS&quot;</span>) <span class="sc">|&gt;</span></span>
+<span id="cb39-670"><a href="#cb39-670" aria-hidden="true" tabindex="-1"></a>  <span class="fu">pull</span>(contribution) <span class="sc">|&gt;</span></span>
+<span id="cb39-671"><a href="#cb39-671" aria-hidden="true" tabindex="-1"></a>  <span class="fu">unique</span>()</span>
+<span id="cb39-672"><a href="#cb39-672" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-673"><a href="#cb39-673" aria-hidden="true" tabindex="-1"></a>grouped <span class="ot">&lt;-</span> contributions <span class="sc">|&gt;</span></span>
+<span id="cb39-674"><a href="#cb39-674" aria-hidden="true" tabindex="-1"></a>  <span class="fu">filter</span>(feature <span class="sc">!=</span> <span class="st">&quot;BIAS&quot;</span>) <span class="sc">|&gt;</span></span>
+<span id="cb39-675"><a href="#cb39-675" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">factor =</span> <span class="fu">feature_group</span>(feature, factor_cols)) <span class="sc">|&gt;</span></span>
+<span id="cb39-676"><a href="#cb39-676" aria-hidden="true" tabindex="-1"></a>  <span class="fu">group_by</span>(persona, factor) <span class="sc">|&gt;</span></span>
+<span id="cb39-677"><a href="#cb39-677" aria-hidden="true" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">contribution =</span> <span class="fu">sum</span>(contribution), <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>)</span>
+<span id="cb39-678"><a href="#cb39-678" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb39-679"><a href="#cb39-679" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-680"><a href="#cb39-680" aria-hidden="true" tabindex="-1"></a>The baseline is <span class="in">`r number(baseline_log_odds, accuracy = 0.01)`</span> log-odds, a</span>
+<span id="cb39-681"><a href="#cb39-681" aria-hidden="true" tabindex="-1"></a><span class="in">`r percent(plogis(baseline_log_odds), accuracy = 0.1)`</span> default probability.</span>
+<span id="cb39-682"><a href="#cb39-682" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-683"><a href="#cb39-683" aria-hidden="true" tabindex="-1"></a><span class="in">```{r top-factors}</span></span>
+<span id="cb39-684"><a href="#cb39-684" aria-hidden="true" tabindex="-1"></a><span class="co">#| results: asis</span></span>
+<span id="cb39-685"><a href="#cb39-685" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (who <span class="cf">in</span> <span class="fu">c</span>(<span class="st">&quot;Jane&quot;</span>, <span class="st">&quot;Marcus&quot;</span>)) {</span>
+<span id="cb39-686"><a href="#cb39-686" aria-hidden="true" tabindex="-1"></a>  score <span class="ot">&lt;-</span> persona_scores<span class="sc">$</span>predicted_default[persona_scores<span class="sc">$</span>persona <span class="sc">==</span> who]</span>
+<span id="cb39-687"><a href="#cb39-687" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;</span><span class="sc">\n</span><span class="st">**%s**: predicted default %s (%s at the 5%% target)</span><span class="sc">\n\n</span><span class="st">&quot;</span>,</span>
+<span id="cb39-688"><a href="#cb39-688" aria-hidden="true" tabindex="-1"></a>              who, <span class="fu">percent</span>(score, <span class="at">accuracy =</span> <span class="fl">0.1</span>),</span>
+<span id="cb39-689"><a href="#cb39-689" aria-hidden="true" tabindex="-1"></a>              persona_scores<span class="sc">$</span>decision[persona_scores<span class="sc">$</span>persona <span class="sc">==</span> who]))</span>
+<span id="cb39-690"><a href="#cb39-690" aria-hidden="true" tabindex="-1"></a>  grouped <span class="sc">|&gt;</span></span>
+<span id="cb39-691"><a href="#cb39-691" aria-hidden="true" tabindex="-1"></a>    <span class="fu">filter</span>(persona <span class="sc">==</span> who) <span class="sc">|&gt;</span></span>
+<span id="cb39-692"><a href="#cb39-692" aria-hidden="true" tabindex="-1"></a>    <span class="fu">slice_max</span>(<span class="fu">abs</span>(contribution), <span class="at">n =</span> <span class="dv">5</span>) <span class="sc">|&gt;</span></span>
+<span id="cb39-693"><a href="#cb39-693" aria-hidden="true" tabindex="-1"></a>    <span class="fu">transmute</span>(<span class="at">rank   =</span> <span class="fu">row_number</span>(),</span>
+<span id="cb39-694"><a href="#cb39-694" aria-hidden="true" tabindex="-1"></a>              factor,</span>
+<span id="cb39-695"><a href="#cb39-695" aria-hidden="true" tabindex="-1"></a>              <span class="at">effect =</span> <span class="fu">if_else</span>(contribution <span class="sc">&gt;</span> <span class="dv">0</span>, <span class="st">&quot;pushes risk up&quot;</span>, <span class="st">&quot;pushes risk down&quot;</span>),</span>
+<span id="cb39-696"><a href="#cb39-696" aria-hidden="true" tabindex="-1"></a>              <span class="at">log_odds =</span> contribution) <span class="sc">|&gt;</span></span>
+<span id="cb39-697"><a href="#cb39-697" aria-hidden="true" tabindex="-1"></a>    <span class="fu">kable</span>(<span class="at">digits =</span> <span class="dv">2</span>) <span class="sc">|&gt;</span></span>
+<span id="cb39-698"><a href="#cb39-698" aria-hidden="true" tabindex="-1"></a>    <span class="fu">print</span>()</span>
+<span id="cb39-699"><a href="#cb39-699" aria-hidden="true" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
+<span id="cb39-700"><a href="#cb39-700" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb39-701"><a href="#cb39-701" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb39-702"><a href="#cb39-702" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-703"><a href="#cb39-703" aria-hidden="true" tabindex="-1"></a>A contribution is measured against the baseline applicant, not against the</span>
+<span id="cb39-704"><a href="#cb39-704" aria-hidden="true" tabindex="-1"></a>median applicant the personas started from, so an unchanged feature can still</span>
+<span id="cb39-705"><a href="#cb39-705" aria-hidden="true" tabindex="-1"></a>appear in the list.</span>
+<span id="cb39-706"><a href="#cb39-706" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-707"><a href="#cb39-707" aria-hidden="true" tabindex="-1"></a>Marcus&#39;s age pushes his risk *down*, although default falls with age overall</span>
+<span id="cb39-708"><a href="#cb39-708" aria-hidden="true" tabindex="-1"></a>in the EDA. That is what the data show once the external scores are known:</span>
+<span id="cb39-709"><a href="#cb39-709" aria-hidden="true" tabindex="-1"></a>among applicants with external scores as low as his, younger applicants</span>
+<span id="cb39-710"><a href="#cb39-710" aria-hidden="true" tabindex="-1"></a>default no more often than middle-aged ones, so the youth effect seen overall</span>
+<span id="cb39-711"><a href="#cb39-711" aria-hidden="true" tabindex="-1"></a>is already carried by the scores.</span>
+<span id="cb39-712"><a href="#cb39-712" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-713"><a href="#cb39-713" aria-hidden="true" tabindex="-1"></a><span class="in">```{r age-check}</span></span>
+<span id="cb39-714"><a href="#cb39-714" aria-hidden="true" tabindex="-1"></a>marcus_ext <span class="ot">&lt;-</span> personas<span class="sc">$</span>EXT_SOURCE_MEAN[personas_raw<span class="sc">$</span>persona <span class="sc">==</span> <span class="st">&quot;Marcus&quot;</span>]</span>
+<span id="cb39-715"><a href="#cb39-715" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-716"><a href="#cb39-716" aria-hidden="true" tabindex="-1"></a>train <span class="sc">|&gt;</span></span>
+<span id="cb39-717"><a href="#cb39-717" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">group =</span> <span class="fu">if_else</span>(EXT_SOURCE_MEAN <span class="sc">&lt;=</span> <span class="fl">0.35</span>, <span class="st">&quot;low_ext_score&quot;</span>, <span class="st">&quot;other&quot;</span>)) <span class="sc">|&gt;</span></span>
+<span id="cb39-718"><a href="#cb39-718" aria-hidden="true" tabindex="-1"></a>  <span class="fu">group_by</span>(AGE_BAND) <span class="sc">|&gt;</span></span>
+<span id="cb39-719"><a href="#cb39-719" aria-hidden="true" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">all_applicants        =</span> <span class="fu">mean</span>(TARGET <span class="sc">==</span> <span class="st">&quot;1&quot;</span>),</span>
+<span id="cb39-720"><a href="#cb39-720" aria-hidden="true" tabindex="-1"></a>            <span class="at">low_ext_score_default =</span> <span class="fu">mean</span>(TARGET[group <span class="sc">==</span> <span class="st">&quot;low_ext_score&quot;</span>] <span class="sc">==</span> <span class="st">&quot;1&quot;</span>),</span>
+<span id="cb39-721"><a href="#cb39-721" aria-hidden="true" tabindex="-1"></a>            <span class="at">low_ext_score_rows    =</span> <span class="fu">sum</span>(group <span class="sc">==</span> <span class="st">&quot;low_ext_score&quot;</span>),</span>
+<span id="cb39-722"><a href="#cb39-722" aria-hidden="true" tabindex="-1"></a>            <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>) <span class="sc">|&gt;</span></span>
+<span id="cb39-723"><a href="#cb39-723" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="fu">across</span>(<span class="fu">c</span>(all_applicants, low_ext_score_default), \(x) <span class="fu">percent</span>(x, <span class="at">accuracy =</span> <span class="fl">0.1</span>))) <span class="sc">|&gt;</span></span>
+<span id="cb39-724"><a href="#cb39-724" aria-hidden="true" tabindex="-1"></a>  <span class="fu">kable</span>(<span class="at">format.args =</span> <span class="fu">list</span>(<span class="at">big.mark =</span> <span class="st">&quot;,&quot;</span>),</span>
+<span id="cb39-725"><a href="#cb39-725" aria-hidden="true" tabindex="-1"></a>        <span class="at">caption =</span> <span class="fu">sprintf</span>(<span class="st">&quot;Default rate by age band; low external score = EXT_SOURCE_MEAN at or below 0.35 (Marcus: %.2f)&quot;</span>,</span>
+<span id="cb39-726"><a href="#cb39-726" aria-hidden="true" tabindex="-1"></a>                          marcus_ext))</span>
 <span id="cb39-727"><a href="#cb39-727" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
 <span id="cb39-728"><a href="#cb39-728" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-729"><a href="#cb39-729" aria-hidden="true" tabindex="-1"></a>A contribution is measured against the baseline applicant, not against the</span>
-<span id="cb39-730"><a href="#cb39-730" aria-hidden="true" tabindex="-1"></a>median applicant the personas started from, so an unchanged feature can still</span>
-<span id="cb39-731"><a href="#cb39-731" aria-hidden="true" tabindex="-1"></a>appear in the list.</span>
-<span id="cb39-732"><a href="#cb39-732" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-733"><a href="#cb39-733" aria-hidden="true" tabindex="-1"></a>Marcus&#39;s age pushes his risk *down*, although default falls with age overall</span>
-<span id="cb39-734"><a href="#cb39-734" aria-hidden="true" tabindex="-1"></a>in the EDA. That is what the data show once the external scores are known:</span>
-<span id="cb39-735"><a href="#cb39-735" aria-hidden="true" tabindex="-1"></a>among applicants with external scores as low as his, younger applicants</span>
-<span id="cb39-736"><a href="#cb39-736" aria-hidden="true" tabindex="-1"></a>default no more often than middle-aged ones, so the youth effect seen overall</span>
-<span id="cb39-737"><a href="#cb39-737" aria-hidden="true" tabindex="-1"></a>is already carried by the scores.</span>
-<span id="cb39-738"><a href="#cb39-738" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-739"><a href="#cb39-739" aria-hidden="true" tabindex="-1"></a><span class="in">```{r age-check}</span></span>
-<span id="cb39-740"><a href="#cb39-740" aria-hidden="true" tabindex="-1"></a>marcus_ext <span class="ot">&lt;-</span> personas<span class="sc">$</span>EXT_SOURCE_MEAN[personas_raw<span class="sc">$</span>persona <span class="sc">==</span> <span class="st">&quot;Marcus&quot;</span>]</span>
-<span id="cb39-741"><a href="#cb39-741" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-742"><a href="#cb39-742" aria-hidden="true" tabindex="-1"></a>train <span class="sc">|&gt;</span></span>
-<span id="cb39-743"><a href="#cb39-743" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="at">group =</span> <span class="fu">if_else</span>(EXT_SOURCE_MEAN <span class="sc">&lt;=</span> <span class="fl">0.35</span>, <span class="st">&quot;low_ext_score&quot;</span>, <span class="st">&quot;other&quot;</span>)) <span class="sc">|&gt;</span></span>
-<span id="cb39-744"><a href="#cb39-744" aria-hidden="true" tabindex="-1"></a>  <span class="fu">group_by</span>(AGE_BAND) <span class="sc">|&gt;</span></span>
-<span id="cb39-745"><a href="#cb39-745" aria-hidden="true" tabindex="-1"></a>  <span class="fu">summarise</span>(<span class="at">all_applicants        =</span> <span class="fu">mean</span>(TARGET <span class="sc">==</span> <span class="st">&quot;1&quot;</span>),</span>
-<span id="cb39-746"><a href="#cb39-746" aria-hidden="true" tabindex="-1"></a>            <span class="at">low_ext_score_default =</span> <span class="fu">mean</span>(TARGET[group <span class="sc">==</span> <span class="st">&quot;low_ext_score&quot;</span>] <span class="sc">==</span> <span class="st">&quot;1&quot;</span>),</span>
-<span id="cb39-747"><a href="#cb39-747" aria-hidden="true" tabindex="-1"></a>            <span class="at">low_ext_score_rows    =</span> <span class="fu">sum</span>(group <span class="sc">==</span> <span class="st">&quot;low_ext_score&quot;</span>),</span>
-<span id="cb39-748"><a href="#cb39-748" aria-hidden="true" tabindex="-1"></a>            <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span>) <span class="sc">|&gt;</span></span>
-<span id="cb39-749"><a href="#cb39-749" aria-hidden="true" tabindex="-1"></a>  <span class="fu">mutate</span>(<span class="fu">across</span>(<span class="fu">c</span>(all_applicants, low_ext_score_default), \(x) <span class="fu">percent</span>(x, <span class="at">accuracy =</span> <span class="fl">0.1</span>))) <span class="sc">|&gt;</span></span>
-<span id="cb39-750"><a href="#cb39-750" aria-hidden="true" tabindex="-1"></a>  <span class="fu">kable</span>(<span class="at">format.args =</span> <span class="fu">list</span>(<span class="at">big.mark =</span> <span class="st">&quot;,&quot;</span>),</span>
-<span id="cb39-751"><a href="#cb39-751" aria-hidden="true" tabindex="-1"></a>        <span class="at">caption =</span> <span class="fu">sprintf</span>(<span class="st">&quot;Default rate by age band; low external score = EXT_SOURCE_MEAN at or below 0.35 (Marcus: %.2f)&quot;</span>,</span>
-<span id="cb39-752"><a href="#cb39-752" aria-hidden="true" tabindex="-1"></a>                          marcus_ext))</span>
-<span id="cb39-753"><a href="#cb39-753" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb39-754"><a href="#cb39-754" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-755"><a href="#cb39-755" aria-hidden="true" tabindex="-1"></a><span class="fu"># Limitations</span></span>
-<span id="cb39-756"><a href="#cb39-756" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb39-757"><a href="#cb39-757" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**Approved applicants only.** The training data holds only applicants Home</span>
-<span id="cb39-758"><a href="#cb39-758" aria-hidden="true" tabindex="-1"></a>  Credit approved; those it declined, and how they would have repaid, are not</span>
-<span id="cb39-759"><a href="#cb39-759" aria-hidden="true" tabindex="-1"></a>  in it (no reject inference). The approval rates here re-rank the applicants</span>
-<span id="cb39-760"><a href="#cb39-760" aria-hidden="true" tabindex="-1"></a>  Home Credit already approved. They do not show what would happen to</span>
-<span id="cb39-761"><a href="#cb39-761" aria-hidden="true" tabindex="-1"></a>  applicants it declined, who are likely riskier.</span>
-<span id="cb39-762"><a href="#cb39-762" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**The benchmark is a stand-in.** <span class="in">`EXT_SOURCE_MEAN`</span> represents underwriting on</span>
-<span id="cb39-763"><a href="#cb39-763" aria-hidden="true" tabindex="-1"></a>  external scores alone. It is not Home Credit&#39;s actual approval policy, which</span>
-<span id="cb39-764"><a href="#cb39-764" aria-hidden="true" tabindex="-1"></a>  is not in the data, so the gains above are measured against this stand-in,</span>
-<span id="cb39-765"><a href="#cb39-765" aria-hidden="true" tabindex="-1"></a>  not against the current process.</span>
-<span id="cb39-766"><a href="#cb39-766" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**`TARGET` marks payment difficulties**, not necessarily a written-off loan,</span>
-<span id="cb39-767"><a href="#cb39-767" aria-hidden="true" tabindex="-1"></a>  and <span class="in">`AMT_CREDIT`</span> is principal, not loss.</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal><i class="bi"></i></button></div>
+<span id="cb39-729"><a href="#cb39-729" aria-hidden="true" tabindex="-1"></a><span class="fu"># Limitations</span></span>
+<span id="cb39-730"><a href="#cb39-730" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-731"><a href="#cb39-731" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**Approved applicants only.** The training data holds only applicants Home</span>
+<span id="cb39-732"><a href="#cb39-732" aria-hidden="true" tabindex="-1"></a>  Credit approved; those it declined, and how they would have repaid, are not</span>
+<span id="cb39-733"><a href="#cb39-733" aria-hidden="true" tabindex="-1"></a>  in it (no reject inference). The approval rates here re-rank the applicants</span>
+<span id="cb39-734"><a href="#cb39-734" aria-hidden="true" tabindex="-1"></a>  Home Credit already approved. They do not show what would happen to</span>
+<span id="cb39-735"><a href="#cb39-735" aria-hidden="true" tabindex="-1"></a>  applicants it declined, who are likely riskier.</span>
+<span id="cb39-736"><a href="#cb39-736" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**The benchmark is a stand-in.** <span class="in">`EXT_SOURCE_MEAN`</span> represents underwriting on</span>
+<span id="cb39-737"><a href="#cb39-737" aria-hidden="true" tabindex="-1"></a>  external scores alone. It is not Home Credit&#39;s actual approval policy, which</span>
+<span id="cb39-738"><a href="#cb39-738" aria-hidden="true" tabindex="-1"></a>  is not in the data, so the gains above are measured against this stand-in,</span>
+<span id="cb39-739"><a href="#cb39-739" aria-hidden="true" tabindex="-1"></a>  not against the current process.</span>
+<span id="cb39-740"><a href="#cb39-740" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**`TARGET` marks payment difficulties**, not necessarily a written-off loan,</span>
+<span id="cb39-741"><a href="#cb39-741" aria-hidden="true" tabindex="-1"></a>  and <span class="in">`AMT_CREDIT`</span> is principal, not loss.</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->
 

@@ -27,6 +27,8 @@
 #   8. Hyperparameter tuning
 #   9. Final model
 #  10. Kaggle submission
+#  11. Business impact
+#  12. Model card
 #
 #   prepared      <- load_prepared()
 #   compare_data  <- stratified_sample(prepared$train, prop = COMPARE_PROP)
@@ -686,4 +688,132 @@ xgb_contributions <- function(fitted, new_data) {
     mutate(.row = seq_len(n()), .before = 1) |>
     pivot_longer(-.row, names_to = "feature", values_to = "contribution") |>
     mutate(feature = if_else(feature %in% c("(Intercept)", "BIAS"), "BIAS", feature))
+}
+
+
+# 12. Model card --------------------------------------------------------------
+# Used by model_card.qmd (and feature_group() by business_impact.qmd).
+# Threshold, calibration and fairness figures come from out-of-fold
+# predictions; SHAP values come from the final model on unseen test rows.
+
+#' Group post-recipe feature names into the applicant attribute they encode.
+#' Several features carry the same input: age appears as DAYS_BIRTH, AGE_YEARS
+#' and AGE_BAND; the external scores as each score plus their mean, minimum,
+#' maximum and count; categories as one dummy per level. `factor_cols` are the
+#' categorical columns before dummying; a dummy is matched to the longest one
+#' its name starts with. Unlisted features keep their own name.
+feature_group <- function(feature, factor_cols) {
+  base <- map_chr(feature, \(f) {
+    hit <- factor_cols[str_starts(f, paste0(factor_cols, "_"))]
+    if (length(hit) > 0) hit[which.max(nchar(hit))] else f
+  })
+  case_when(
+    str_detect(base, "^(FLAG_MISSING_)?EXT_SOURCE")       ~ "External credit scores",
+    str_detect(base, "^(DAYS_BIRTH|AGE_YEARS|AGE_BAND)") ~ "Age",
+    base %in% c("DAYS_EMPLOYED", "YEARS_EMPLOYED",
+                "FLAG_DAYS_EMPLOYED_PLACEHOLDER")        ~ "Years in current job",
+    base == "EMPLOYED_AGE_RATIO"                          ~ "Share of life spent in current job",
+    base == "DAYS_LAST_PHONE_CHANGE"                      ~ "Time since phone number changed",
+    base %in% c("DAYS_ID_PUBLISH", "YEARS_ID_PUBLISHED") ~ "Time since ID document issued",
+    base %in% c("DAYS_REGISTRATION", "YEARS_REGISTERED") ~ "Time since registration changed",
+    base == "CREDIT_GOODS_RATIO"                          ~ "Loan relative to price of goods",
+    base == "CREDIT_TERM"                                 ~ "Payment relative to loan (implied term)",
+    base == "CREDIT_INCOME_RATIO"                         ~ "Loan relative to income",
+    base == "ANNUITY_INCOME_RATIO"                        ~ "Payment relative to income",
+    str_detect(base, "^(FLAG_MISSING_)?AMT_GOODS_PRICE") ~ "Price of goods financed",
+    str_detect(base, "^(FLAG_MISSING_)?AMT_ANNUITY")     ~ "Payment amount",
+    base == "AMT_CREDIT"                                  ~ "Loan amount",
+    base == "NAME_EDUCATION_TYPE"                         ~ "Education level",
+    base == "REGION_POPULATION_RELATIVE"                  ~ "Population of home region",
+    str_starts(base, "REGION_RATING_CLIENT")              ~ "Region risk rating",
+    str_starts(base, "AMT_REQ_CREDIT_BUREAU")             ~ "Recent credit bureau enquiries",
+    base %in% c("FLAG_OWN_CAR", "FLAG_MISSING_OWN_CAR_AGE",
+                "OWN_CAR_AGE")                           ~ "Car ownership",
+    base == "FLAG_WORK_PHONE"                             ~ "Work phone provided",
+    base == "NAME_INCOME_TYPE"                            ~ "Income type",
+    base == "NAME_FAMILY_STATUS"                          ~ "Family status",
+    base == "OCCUPATION_TYPE"                             ~ "Occupation",
+    base == "ORGANIZATION_TYPE"                           ~ "Employer type",
+    str_ends(base, "_CNT_SOCIAL_CIRCLE")                  ~ "Defaults in social circle",
+    str_detect(base, "^(REG|LIVE)_(REGION|CITY)_NOT_")   ~ "Home, registered and work address differ",
+    base %in% c("AMT_INCOME_TOTAL", "INCOME_PER_PERSON") ~ "Income",
+    TRUE                                                  ~ base
+  )
+}
+
+#' Break-even predicted default probability for one loan. Approving earns
+#' margin x principal with probability 1 - p and loses lgd x principal with
+#' probability p, so expected profit is positive while p < m / (m + lgd).
+break_even_cutoff <- function(margin, lgd) margin / (margin + lgd)
+
+#' Approve everyone with predicted default at or below each cutoff, and total
+#' the principal of the approved loans that repaid and that defaulted, per
+#' 100,000 applicants. Profit under any margin and LGD is then
+#' margin x repaid_credit - lgd x defaulted_credit (see add_profit()), so one
+#' pass over the cutoffs serves every scenario.
+cutoff_sweep <- function(risk, default, credit, cutoffs) {
+  per_100k <- 1e5 / length(risk)
+  map(cutoffs, \(cut) {
+    ok <- risk <= cut
+    tibble(cutoff           = cut,
+           approval_rate    = mean(ok),
+           default_rate     = mean(default[ok]),
+           repaid_credit    = sum(credit[ok & !default]) * per_100k,
+           defaulted_credit = sum(credit[ok & default]) * per_100k)
+  }) |>
+    list_rbind()
+}
+
+#' Profit per 100,000 applicants for a cutoff_sweep() under one margin and LGD,
+#' both as shares of principal over the loan's life.
+add_profit <- function(sweep, margin, lgd) {
+  sweep |> mutate(profit = margin * repaid_credit - lgd * defaulted_credit)
+}
+
+#' Outcomes at one cutoff. "Positive" is a predicted default, i.e. a decline:
+#' precision is the share of declined applicants who would have defaulted,
+#' recall the share of all defaulters the model declines. The confusion matrix
+#' is per 100,000 applicants.
+threshold_metrics <- function(risk, default, cutoff) {
+  declined <- risk > cutoff
+  per_100k <- 1e5 / length(risk)
+  list(
+    metrics = tibble(cutoff        = cutoff,
+                     precision     = mean(default[declined]),
+                     recall        = sum(declined & default) / sum(default),
+                     approval_rate = mean(!declined),
+                     approved_default_rate = mean(default[!declined])),
+    confusion = tibble(outcome  = if_else(default, "Would have defaulted", "Would have repaid"),
+                       decision = if_else(declined, "Declined", "Approved")) |>
+      count(outcome, decision) |>
+      mutate(n = n * per_100k) |>
+      pivot_wider(names_from = decision, values_from = n)
+  )
+}
+
+#' Predicted against actual default rate by quantile of predicted risk.
+calibration_table <- function(risk, default, n = 10) {
+  tibble(bin = ntile(risk, n), risk, default) |>
+    group_by(bin) |>
+    summarise(applicants        = n(),
+              predicted_default = mean(risk),
+              actual_default    = mean(default),
+              .groups = "drop")
+}
+
+#' Approval outcomes by group at one cutoff. The adverse impact ratio is each
+#' group's approval rate over the highest group's; under the four-fifths rule
+#' a ratio below 0.80 is evidence of adverse impact worth reviewing. The
+#' actual default rate sits beside it, so a disparity that tracks repayment
+#' can be told from one that does not.
+group_outcomes <- function(group, risk, default, cutoff) {
+  tibble(group, approved = risk <= cutoff, default) |>
+    group_by(group) |>
+    summarise(applicants            = n(),
+              actual_default_rate   = mean(default),
+              approval_rate         = mean(approved),
+              approved_default_rate = mean(default[approved]),
+              .groups = "drop") |>
+    mutate(impact_ratio      = approval_rate / max(approval_rate),
+           below_four_fifths = impact_ratio < 0.80)
 }

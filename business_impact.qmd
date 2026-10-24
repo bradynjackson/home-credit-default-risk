@@ -662,32 +662,6 @@ applicant.
 ```{r contributions}
 factor_cols <- names(select(train, where(is.factor), -TARGET))
 
-feature_group <- function(feature) {
-  base <- map_chr(feature, \(f) {
-    hit <- factor_cols[str_starts(f, paste0(factor_cols, "_"))]
-    if (length(hit) > 0) hit[which.max(nchar(hit))] else f
-  })
-  case_when(
-    str_detect(base, "^(FLAG_MISSING_)?EXT_SOURCE")       ~ "External credit scores",
-    str_detect(base, "^(DAYS_BIRTH|AGE_YEARS|AGE_BAND)") ~ "Age",
-    base %in% c("DAYS_EMPLOYED", "YEARS_EMPLOYED")       ~ "Years in current job",
-    base == "EMPLOYED_AGE_RATIO"                          ~ "Share of life spent in current job",
-    base == "DAYS_LAST_PHONE_CHANGE"                      ~ "Time since phone number changed",
-    base %in% c("DAYS_ID_PUBLISH", "YEARS_ID_PUBLISHED") ~ "Time since ID document issued",
-    base %in% c("DAYS_REGISTRATION", "YEARS_REGISTERED") ~ "Time since registration changed",
-    base == "CREDIT_GOODS_RATIO"                          ~ "Loan relative to price of goods",
-    base == "CREDIT_TERM"                                 ~ "Payment relative to loan (implied term)",
-    base == "CREDIT_INCOME_RATIO"                         ~ "Loan relative to income",
-    base == "ANNUITY_INCOME_RATIO"                        ~ "Payment relative to income",
-    base == "AMT_GOODS_PRICE"                             ~ "Price of goods financed",
-    base == "AMT_ANNUITY"                                 ~ "Payment amount",
-    base == "AMT_CREDIT"                                  ~ "Loan amount",
-    base == "NAME_EDUCATION_TYPE"                         ~ "Education level",
-    base == "REGION_POPULATION_RELATIVE"                  ~ "Population of home region",
-    TRUE                                                  ~ base
-  )
-}
-
 contributions <- xgb_contributions(final_fit, personas) |>
   mutate(persona = personas_raw$persona[.row])
 
@@ -698,7 +672,7 @@ baseline_log_odds <- contributions |>
 
 grouped <- contributions |>
   filter(feature != "BIAS") |>
-  mutate(factor = feature_group(feature)) |>
+  mutate(factor = feature_group(feature, factor_cols)) |>
   group_by(persona, factor) |>
   summarise(contribution = sum(contribution), .groups = "drop")
 ```
