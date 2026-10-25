@@ -68,3 +68,6 @@ submission*.csv
 
 # Quarto render support folders
 *_files/
+
+# Working brief for the model card (not part of the deliverable)
+model_card_brief.md

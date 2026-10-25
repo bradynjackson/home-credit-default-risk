@@ -166,6 +166,58 @@ does not.
   most likely because the final model trained on all rows rather than one CV
   fold's ~41,000.
 
+### 4. Business impact
+
+`business_impact.qmd` (rendered to
+[`business_impact.html`](business_impact.html)) turns the final model into
+lending outcomes. Every training applicant is scored out-of-fold (3 folds on
+all 307,511 rows, so no applicant is scored by a model that saw them; AUC
+0.762), and the model is compared with a benchmark that ranks applicants on
+`EXT_SOURCE_MEAN`, the average external credit score (AUC 0.716).
+
+- **More approvals at the same risk:** with a 5% default-rate target among
+  approved applicants, the model approves 82.5% of applicants against the
+  benchmark's 75.0% (+7.5 points; BPS target +1 point).
+- **Fewer losses at the same approval rate:** approving as many applicants as
+  the benchmark does, the model holds 11.8% less defaulted `AMT_CREDIT`
+  (12.9% fewer defaults).
+- **Financials:** applied to Home Credit's Q1 2019 impairment losses
+  (annualised), that is up to EUR 204M a year, an upper bound because the
+  current process is stronger than the benchmark. The BPS target of a 5% loss
+  reduction (EUR 86M) needs 42% of the model's edge.
+- **Personas:** two fictional applicants, scored and explained with SHAP
+  contributions.
+
+### 5. Model card
+
+`model_card.qmd` (rendered to [`model_card.html`](model_card.html), no code
+shown) documents the final model for a business stakeholder deciding whether
+to deploy it. It reuses the cached final model and out-of-fold predictions;
+nothing is refit.
+
+- **Decision threshold:** decline applicants with a predicted default
+  probability above **13.5%**, the profit-maximising cutoff assuming a 15%
+  margin and 90% loss given default (sources cited in the card). It approves
+  83.3% of applicants, cuts the default rate among approved from 8.07% to
+  5.09%, and earns within 0.1% of the maximum anywhere from 13.0% to 15.0%.
+  Predictions are calibrated, so the break-even rule p < m / (m + LGD) holds
+  in every scenario tested.
+- **Financial impact:** against the external-score benchmark at the same
+  approval rate, 9.8% less defaulted credit, up to EUR 168M a year (upper
+  bound).
+- **Explainability:** SHAP (TreeSHAP) on 1,000 unseen test applicants.
+  External credit scores carry 32% of the importance, followed by the implied
+  loan term (`CREDIT_TERM`) and loan relative to the price of goods. Every
+  factor behind a decline is mapped to adverse-action reason text, with
+  legally sensitive and hard-to-explain factors flagged.
+- **Fairness:** no gender or education group falls below the four-fifths
+  line; applicants aged 20 to 35 do, in line with their higher actual default
+  rates. Removing marital status (`NAME_FAMILY_STATUS`, an ECOA-prohibited
+  basis) would cost 0.0008 AUC.
+- **Before deployment:** refit without family status, replace or constrain
+  `CREDIT_TERM` (hard to explain and the most-drifted feature), and review the
+  other hard-to-explain inputs.
+
 ## Repository Structure
 
 ```
@@ -176,7 +228,11 @@ home-credit-default-risk/
 ├── data_preparation.R        # reusable cleaning and feature functions
 ├── modeling_home_credit.qmd  # modeling notebook source
 ├── modeling_home_credit.html # rendered modeling report
-├── modeling_functions.R      # reusable sampling, recipe, model and tuning functions
+├── modeling_functions.R      # reusable sampling, recipe, model, tuning, business-impact and model-card functions
+├── business_impact.qmd       # business impact notebook source
+├── business_impact.html      # rendered business impact report
+├── model_card.qmd            # model card source
+├── model_card.html           # rendered model card (no code shown)
 ├── .gitignore
 └── README.md
 ```
