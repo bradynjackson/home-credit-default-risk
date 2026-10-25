@@ -1,0 +1,1337 @@
+---
+title: "Home Credit Default Risk: Model Card"
+author: "Bradyn Jackson"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    embed-resources: true
+    theme: cosmo
+    fig-width: 8
+    fig-height: 5
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(scales)
+library(knitr)
+library(shapviz)
+
+# Loads tidymodels, the shared constants and the model-card helpers
+# (section 12).
+source("modeling_functions.R")
+
+theme_set(theme_minimal(base_size = 12))
+
+model_colour     <- "#4C6EF5"
+benchmark_colour <- "#868E96"
+
+pct   <- \(x, accuracy = 0.1) percent(x, accuracy = accuracy)
+money <- \(x) paste0(comma(x / 1e6), "M")
+```
+
+```{r load}
+# Every fit below is loaded from the modeling notebook's caches; nothing is
+# refit. The cache lines are captured and checked here (and listed in the
+# appendix) rather than printed into the card.
+cache_log <- capture.output({
+  prepared <- load_prepared()
+  train    <- prepared$train
+  test     <- prepared$test
+
+  cv_metrics <- metric_set(roc_auc, accuracy)
+
+  compare_data  <- stratified_sample(train, prop = COMPARE_PROP)
+  compare_folds <- make_cv_folds(compare_data)
+  tune_data     <- stratified_sample(train, n = TUNE_N)
+  tune_folds    <- make_cv_folds(tune_data)
+
+  xgb_tune_wf <- workflow(build_recipe(tune_data), xgb_tune_spec())
+  xgb_grid    <- random_tune_grid(xgb_tune_wf, tune_data, size = 20)
+  xgb_tuning  <- tune_grid_cached("xgb_tuning", xgb_tune_wf, tune_folds,
+                                  xgb_grid, cv_metrics)
+
+  xgb_rescored <- rescore_top(xgb_tuning, xgb_tune_wf, compare_folds, cv_metrics, n = 3)
+  best_config  <- map(xgb_rescored, \(f) collect_metrics(f$result)) |>
+    list_rbind(names_to = ".config") |>
+    filter(.metric == "roc_auc") |>
+    slice_max(mean, n = 1) |>
+    pull(.config)
+  best_params <- show_best(xgb_tuning$result, metric = "roc_auc", n = 3) |>
+    filter(.config == best_config) |>
+    select(mtry:sample_size)
+
+  trees_sweep <- sweep_trees(extract_preprocessor(xgb_tune_wf), best_params,
+                             trees = c(500, 1000, 1500, 2000),
+                             folds = compare_folds, metrics = cv_metrics)
+  best_trees  <- pick_trees(trees_sweep)
+
+  final_exclude <- "CODE_GENDER"
+
+  cv_nogender <- fit_resamples_cached("xgb_tuned_nogender",
+    finalize_workflow(
+      workflow(build_recipe(compare_data, exclude = final_exclude),
+               xgb_tune_spec(trees = best_trees)),
+      best_params),
+    compare_folds, cv_metrics)
+
+  # Pre-deployment check: the final configuration without marital status too.
+  cv_nofamily <- fit_resamples_cached("xgb_tuned_nogender_nofamily",
+    finalize_workflow(
+      workflow(build_recipe(compare_data, exclude = c(final_exclude, "NAME_FAMILY_STATUS")),
+               xgb_tune_spec(trees = best_trees)),
+      best_params),
+    compare_folds, cv_metrics)
+
+  final_wf <- finalize_workflow(
+    workflow(build_recipe(train, exclude = final_exclude),
+             xgb_tune_spec(trees = best_trees)),
+    best_params)
+
+  final     <- fit_final_cached("xgb_tuned_final_nogender", final_wf, train)
+  final_fit <- final$result
+
+  full_folds <- make_cv_folds(train)
+  oof <- oof_predictions_cached("xgb_final_oof", final_wf, full_folds, cv_metrics)
+})
+
+stopifnot(length(cache_log) > 0,
+          all(str_starts(cache_log, "Loaded cached result")))
+
+# The rebuilt configuration must match the saved final model exactly.
+saved_args <- map(extract_spec_parsnip(final_fit)$args, rlang::eval_tidy)
+stopifnot(all(map_lgl(names(best_params), \(p)
+                as.numeric(best_params[[p]]) == as.numeric(saved_args[[p]]))),
+          best_trees == as.numeric(saved_args$trees))
+```
+
+```{r scored}
+# Raw AMT_CREDIT (the prepared data caps it at the 99th percentile) and raw
+# CODE_GENDER (the prepared data imputes its 4 XNA rows to the mode, F).
+prep_env  <- new.env()
+source("data_preparation.R", local = prep_env)
+raw_train <- prep_env$read_application("data/application_train.csv")
+stopifnot(identical(raw_train$SK_ID_CURR, train$SK_ID_CURR))
+
+scored <- oof$result$predictions |>
+  arrange(.row) |>
+  transmute(fold        = id,
+            SK_ID_CURR  = train$SK_ID_CURR[.row],
+            TARGET,
+            default     = TARGET == "1",
+            model_risk  = .pred_1,
+            credit      = raw_train$AMT_CREDIT[.row],
+            ext_source  = train$EXT_SOURCE_MEAN[.row],
+            gender      = raw_train$CODE_GENDER[.row],
+            education   = train$NAME_EDUCATION_TYPE[.row],
+            age_band    = train$AGE_BAND[.row])
+
+n_applicants <- nrow(scored)
+per_100k     <- 1e5 / n_applicants
+
+stopifnot(n_applicants == 307511,
+          n_distinct(scored$SK_ID_CURR) == n_applicants,
+          identical(scored$TARGET, train$TARGET),
+          !anyNA(scored$credit))
+```
+
+```{r threshold-compute}
+# Computed here because the performance section reports results at the
+# chosen threshold.
+cutoffs  <- seq(0.02, 0.40, by = 0.005)
+sweep    <- cutoff_sweep(scored$model_risk, scored$default, scored$credit, cutoffs)
+everyone <- cutoff_sweep(scored$model_risk, scored$default, scored$credit, cutoffs = 1)
+stopifnot(everyone$approval_rate == 1)
+
+scenarios <- tribble(
+  ~scenario,          ~margin, ~lgd,
+  "Base",             0.15,    0.90,
+  "Lenient recovery", 0.15,    0.45,
+  "Thin margin",      0.05,    0.90,
+  "High margin",      0.20,    0.90
+) |>
+  mutate(scenario   = fct_inorder(scenario),
+         break_even = break_even_cutoff(margin, lgd))
+
+scenario_curves <- scenarios |>
+  pmap(\(scenario, margin, lgd, break_even)
+    add_profit(sweep, margin, lgd) |> mutate(scenario = scenario)) |>
+  list_rbind()
+
+optima <- scenario_curves |>
+  group_by(scenario) |>
+  slice_max(profit, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  left_join(scenarios, by = "scenario") |>
+  mutate(everyone_profit = map2_dbl(margin, lgd, \(m, l) add_profit(everyone, m, l)$profit),
+         vs_everyone     = profit - everyone_profit)
+
+# An optimum on the edge of the sweep would mean the range is too narrow.
+stopifnot(all(optima$cutoff > min(cutoffs) & optima$cutoff < max(cutoffs)))
+
+base <- optima |> filter(scenario == "Base")
+chosen_cutoff <- round(base$cutoff / 0.005) * 0.005
+
+# How flat the base-case curve is near its peak.
+near_peak <- scenario_curves |>
+  filter(scenario == "Base", profit >= 0.999 * base$profit) |>
+  pull(cutoff) |>
+  range()
+
+at_chosen <- threshold_metrics(scored$model_risk, scored$default, chosen_cutoff)
+stopifnot(isTRUE(all.equal(sum(select(at_chosen$confusion, -outcome)), 1e5)))
+```
+
+<!-- Computation only: everything below to the next heading prints nothing. It runs before the executive summary, which reports its results. -->
+
+```{r explain-compute}
+# SHAP values for 1,000 unseen test applicants.
+shap_sample <- withr::with_seed(MODEL_SEED, slice_sample(test, n = 1000))
+shap_risk   <- predict(final_fit, shap_sample, type = "prob")$.pred_1
+
+# xgb_contributions() checks that baseline plus contributions reproduces the
+# workflow's predicted probability for every row before returning.
+contrib <- xgb_contributions(final_fit, shap_sample)
+factor_cols <- names(select(train, where(is.factor), -TARGET))
+
+baseline_log_odds <- contrib |> filter(feature == "BIAS") |> pull(contribution) |> unique()
+
+shap_long <- contrib |>
+  filter(feature != "BIAS") |>
+  mutate(factor = feature_group(feature, factor_cols))
+
+grouped <- shap_long |>
+  group_by(.row, factor) |>
+  summarise(contribution = sum(contribution), .groups = "drop")
+
+stopifnot(nrow(shap_sample) == 1000,
+          n_distinct(shap_sample$SK_ID_CURR) == 1000,
+          length(baseline_log_odds) == 1,
+          # Grouping only regroups: each row's contributions still sum to its log-odds.
+          isTRUE(all.equal(
+            baseline_log_odds + as.numeric(tapply(grouped$contribution, grouped$.row, sum)),
+            qlogis(shap_risk), tolerance = 1e-5)))
+
+importance <- grouped |>
+  group_by(factor) |>
+  summarise(mean_abs = mean(abs(contribution)), .groups = "drop") |>
+  mutate(share = mean_abs / sum(mean_abs)) |>
+  arrange(desc(mean_abs))
+
+shap_wide <- contrib |>
+  filter(feature != "BIAS") |>
+  pivot_wider(names_from = feature, values_from = contribution) |>
+  arrange(.row)
+
+feature_values <- bake(extract_recipe(final_fit), shap_sample, all_predictors()) |>
+  select(all_of(setdiff(names(shap_wide), ".row"))) |>
+  mutate(across(everything(), as.numeric)) |>
+  as.data.frame()
+```
+
+```{r factor-map}
+# Direction, adverse-action condition and reason text for each grouped factor.
+# key/sign: the feature whose value-SHAP relationship is checked below (+1:
+# higher value raises risk, -1: lowers it, NA: not checked because the
+# effect is not monotone or the factor is categorical).
+# type: "Sensitive" (protected basis or proxy), "Hard to explain" (to an
+# applicant), "Opaque score" (third-party score), or "" (none).
+factor_map <- tribble(
+  ~factor, ~key, ~sign, ~direction, ~condition, ~reason, ~type, ~flag,
+  "External credit scores", "EXT_SOURCE_MEAN", -1,
+    "Higher external scores lower risk",
+    "Low external credit scores",
+    "Limited or weak credit history with external credit agencies",
+    "Opaque score", "Third-party scores: reason text can only be generic",
+  "Payment relative to loan (implied term)", "CREDIT_TERM", NA,
+    "Not monotone: some repayment schedules carry more risk than others",
+    "Payment-to-loan ratio in a higher-risk range",
+    "Requested loan term and repayment schedule",
+    "Hard to explain", "The effect jumps between neighbouring terms",
+  "Loan relative to price of goods", "CREDIT_GOODS_RATIO", 1,
+    "Borrowing more than the goods cost raises risk",
+    "Loan large relative to the price of the goods",
+    "Amount requested is high relative to the value of the purchase",
+    "", "",
+  "Price of goods financed", "AMT_GOODS_PRICE", -1,
+    "For a given loan, lower-priced goods raise risk",
+    "Low price of goods financed",
+    "Value of the goods being financed",
+    "Hard to explain", "Overlaps with loan relative to price of goods",
+  "Education level", NA, NA,
+    "Secondary education or less raises risk; higher education lowers it",
+    "Secondary or lower secondary education",
+    "Level of education",
+    "Sensitive", "Proxy concern for protected characteristics",
+  "Payment amount", "AMT_ANNUITY", 1,
+    "Larger payments raise risk",
+    "High payment amount",
+    "Payment amount requested is high",
+    "", "",
+  "Age", NA, NA,
+    "Not monotone once other factors are known (see below)",
+    "Age band with higher model-estimated risk",
+    "Age",
+    "Sensitive", "ECOA permits age in an empirically derived system only if it does not disadvantage elderly applicants",
+  "Time since ID document issued", "DAYS_ID_PUBLISH", 1,
+    "A recently issued ID raises risk",
+    "Identity document issued recently",
+    "Length of time current identification has been held",
+    "Hard to explain", "",
+  "Share of life spent in current job", "EMPLOYED_AGE_RATIO", -1,
+    "A longer share of working life in the current job lowers risk",
+    "Short time in current job relative to age",
+    "Length of employment is short relative to age",
+    "", "",
+  "Years in current job", "DAYS_EMPLOYED", 1,
+    "Longer employment lowers risk",
+    "Short time with current employer",
+    "Length of time with current employer",
+    "", "",
+  "Recent credit bureau enquiries", "AMT_REQ_CREDIT_BUREAU_QRT", -1,
+    "No recent enquiries raises risk; zero includes applicants with no bureau record",
+    "No recent credit bureau enquiries or no bureau record",
+    "Limited recent credit history",
+    "Hard to explain", "Zero mixes no enquiries with no bureau record (imputed)",
+  "Time since phone number changed", "DAYS_LAST_PHONE_CHANGE", 1,
+    "A recently changed phone number raises risk",
+    "Phone number changed recently",
+    "Recent change in contact information",
+    "Hard to explain", "",
+  "Work phone provided", "FLAG_WORK_PHONE", 1,
+    "Giving a work phone number raises risk",
+    "Work phone number provided",
+    "Work phone number provided on application",
+    "Hard to explain", "Counter-intuitive direction",
+  "Payment relative to income", "ANNUITY_INCOME_RATIO", 1,
+    "Payments high relative to income raise risk",
+    "Payment high relative to income",
+    "Payment is high relative to income",
+    "", "",
+  "Income", "INCOME_PER_PERSON", 1,
+    "For given loan and payment ratios, higher income raises risk",
+    "Higher reported income for the loan and payment requested",
+    "Reported income",
+    "Hard to explain", "Counter-intuitive direction",
+  "Income type", NA, NA,
+    "Wage earners carry more risk than pensioners, state servants and commercial associates",
+    "Income from wage employment",
+    "Type of income",
+    "Sensitive", "Pension income relates to age",
+  "Family status", NA, NA,
+    "Single, separated and civil-marriage applicants carry more risk than married ones",
+    "Not married",
+    "Marital status",
+    "Sensitive", "Marital status is an ECOA-prohibited basis",
+  "Occupation", NA, NA,
+    "Some occupations (e.g. drivers) carry more risk; core and medical staff less",
+    "Occupation with higher historical risk",
+    "Occupation",
+    "", "",
+  "Employer type", NA, NA,
+    "Some employer sectors carry more risk",
+    "Employer sector with higher historical risk",
+    "Type of employer",
+    "", "",
+  "Car ownership", "FLAG_OWN_CAR_Y", -1,
+    "Owning a car lowers risk",
+    "No car owned",
+    "Limited assets reported",
+    "", "",
+  "Loan amount", "AMT_CREDIT", 1,
+    "Larger loans raise risk",
+    "Large loan amount",
+    "Amount of credit requested",
+    "", "",
+  "Region risk rating", "REGION_RATING_CLIENT_W_CITY", 1,
+    "Applicants from higher-rated (riskier) regions carry more risk",
+    "Home region rated higher risk",
+    "Location of residence",
+    "Sensitive", "Geography can proxy for protected characteristics",
+  "Defaults in social circle", "DEF_30_CNT_SOCIAL_CIRCLE", 1,
+    "More defaults among the applicant's social circle raise risk",
+    "People in the applicant's social circle have defaulted",
+    "Credit performance of associated persons",
+    "Sensitive", "Judges the applicant on other people's repayment",
+  "Home, registered and work address differ", "REG_CITY_NOT_LIVE_CITY", 1,
+    "A home city different from the registered city raises risk",
+    "Lives outside the city of registration",
+    "Residence differs from registered address",
+    "Hard to explain", "",
+  "Time since registration changed", "YEARS_REGISTERED", -1,
+    "A recently changed registration raises risk",
+    "Registration changed recently",
+    "Length of time at registered address",
+    "Hard to explain", ""
+)
+
+stopifnot(!anyDuplicated(factor_map$factor),
+          all(factor_map$type %in% c("Sensitive", "Hard to explain", "Opaque score", "")))
+
+# Check every stated direction against the sample: the rank correlation
+# between a key feature's value and its own SHAP value must have that sign.
+direction_check <- factor_map |>
+  filter(!is.na(sign)) |>
+  mutate(observed = map_dbl(key, \(f)
+    cor(feature_values[[f]], shap_wide[[f]], method = "spearman")))
+stopifnot(all(sign(direction_check$observed) == direction_check$sign),
+          all(abs(direction_check$observed) > 0.3))
+```
+
+```{r adverse-compute}
+declined_rows <- which(shap_risk > chosen_cutoff)
+
+# Each declined applicant's top three risk-increasing factors.
+declined_top3 <- grouped |>
+  filter(.row %in% declined_rows, contribution > 0) |>
+  group_by(.row) |>
+  slice_max(contribution, n = 3, with_ties = FALSE) |>
+  mutate(rank = row_number()) |>
+  ungroup() |>
+  left_join(select(factor_map, factor, type), by = "factor")
+
+top_factors <- importance |> slice_head(n = 10)
+stopifnot(n_distinct(declined_top3$.row) == length(declined_rows),
+          all(top_factors$factor %in% factor_map$factor),
+          all(declined_top3$factor %in% factor_map$factor))
+
+declined_counts <- declined_top3 |> count(factor, name = "in_top3")
+
+flagged_types <- c("Sensitive", "Hard to explain")
+
+coverage <- declined_top3 |>
+  group_by(.row) |>
+  summarise(any_flagged   = any(type %in% flagged_types),
+            first_flagged = type[rank == 1] %in% flagged_types,
+            any_sensitive = any(type == "Sensitive"),
+            first_opaque  = type[rank == 1] == "Opaque score",
+            any_term      = any(factor == "Payment relative to loan (implied term)"),
+            .groups = "drop")
+stopifnot(nrow(coverage) == length(declined_rows))
+```
+
+```{r exclusion-costs}
+# Same pattern as the modeling notebook's CODE_GENDER check: paired folds,
+# positive difference = AUC lost by excluding the feature.
+gender_paired <- paired_folds(trees_sweep[[as.character(best_trees)]], cv_nogender)
+family_paired <- paired_folds(cv_nogender, cv_nofamily)
+gender_cost   <- mean(gender_paired$difference)
+family_cost   <- mean(family_paired$difference)
+```
+
+```{r fairness}
+fairness_table <- function(outcomes, group_label) {
+  outcomes |>
+    transmute(group = as.character(group),
+              applicants = comma(applicants),
+              actual_default_rate = pct(actual_default_rate, 0.01),
+              approval_rate = pct(approval_rate, 0.1),
+              approved_default_rate = pct(approved_default_rate, 0.01),
+              impact_ratio = number(impact_ratio, accuracy = 0.01),
+              flag = if_else(below_four_fifths, "Below 0.80", "")) |>
+    kable(col.names = c(group_label, "Applicants", "Actual default rate", "Approval rate",
+                        "Default rate among approved", "Impact ratio", "Four-fifths"),
+          align = "lrrrrrl")
+}
+
+known_gender <- scored |> filter(gender != "XNA")
+by_gender    <- group_outcomes(if_else(known_gender$gender == "F", "Female", "Male"),
+                               known_gender$model_risk, known_gender$default, chosen_cutoff)
+by_education <- group_outcomes(scored$education, scored$model_risk, scored$default, chosen_cutoff)
+by_age       <- group_outcomes(scored$age_band, scored$model_risk, scored$default, chosen_cutoff)
+
+n_xna <- sum(scored$gender == "XNA")
+stopifnot(n_xna == 4,
+          sum(by_gender$applicants) + n_xna == n_applicants,
+          sum(by_education$applicants) == n_applicants,
+          sum(by_age$applicants) == n_applicants)
+```
+
+```{r financial-compute}
+# Financial impact at the chosen threshold. The benchmark (EXT_SOURCE_MEAN,
+# as in business_impact.qmd) approves the same number of applicants.
+model_path     <- approval_path(scored$model_risk, scored$default, scored$credit)
+benchmark_path <- approval_path(-scored$ext_source, scored$default, scored$credit)
+
+model_approved     <- scored$model_risk <= chosen_cutoff
+n_approved         <- sum(model_approved)
+benchmark_approved <- seq_len(n_applicants) %in% order(-scored$ext_source)[seq_len(n_approved)]
+model_k     <- model_path[n_approved, ]
+benchmark_k <- benchmark_path[n_approved, ]
+
+stopifnot(model_k$defaults == sum(scored$default[model_approved]),
+          benchmark_k$defaults == sum(scored$default[benchmark_approved]))
+
+# Profit per 100,000 applicants for any approved set.
+portfolio_profit <- function(approved, margin = base$margin, lgd = base$lgd) {
+  (margin * sum(scored$credit[approved & !scored$default]) -
+     lgd * sum(scored$credit[approved & scored$default])) * per_100k
+}
+model_profit <- portfolio_profit(model_approved)
+stopifnot(isTRUE(all.equal(model_profit, base$profit)))
+
+# BPS Q1 2019 figures, as in business_impact.qmd.
+q1_impairment_eur  <- 430e6
+annual_impairment  <- 4 * q1_impairment_eur
+cost_of_risk       <- 0.0229   # quarterly: one quarter's impairment over loans
+bps_loss_reduction <- 0.05     # BPS target: 5% fewer losses
+
+financial <- list(
+  vs_everyone      = model_profit - portfolio_profit(rep(TRUE, n_applicants)),
+  vs_benchmark     = model_profit - portfolio_profit(benchmark_approved),
+  defaults_avoided = (benchmark_k$defaults - model_k$defaults) * per_100k,
+  count_reduction  = 1 - model_k$defaults / benchmark_k$defaults,
+  credit_reduction = 1 - model_k$defaulted_credit / benchmark_k$defaulted_credit
+)
+financial$annual_saving <- annual_impairment * financial$credit_reduction
+financial$bps_saving    <- annual_impairment * bps_loss_reduction
+
+# business_impact.qmd's comparison: both scores at the benchmark's approval
+# count under a 5% default-rate target.
+bench_5 <- at_target_rate(benchmark_path, 0.05)
+model_5 <- model_path[bench_5$approved, ]
+financial$saving_at_5 <- annual_impairment * (1 - model_5$defaulted_credit / bench_5$defaulted_credit)
+```
+
+```{r summary-compute}
+# Age bands below the four-fifths line, as a readable range.
+flagged_bands  <- by_age |> filter(below_four_fifths) |> pull(group) |> as.character()
+band_limits    <- as.numeric(unlist(str_extract_all(flagged_bands, "\\d+")))
+flagged_age_range <- sprintf("%d to %d", min(band_limits), max(band_limits))
+stopifnot(length(flagged_bands) > 0)
+
+drift_cols <- c("CREDIT_TERM", "CREDIT_INCOME_RATIO", "CREDIT_GOODS_RATIO",
+                "ANNUITY_INCOME_RATIO", "AMT_CREDIT", "EXT_SOURCE_MEAN", "AGE_YEARS")
+drift <- drift_table(train, test, drift_cols) |> arrange(desc(abs(smd)))
+term_smd <- drift$smd[drift$predictor == "CREDIT_TERM"]
+stopifnot(drift$predictor[1] == "CREDIT_TERM")   # the most-drifted feature
+
+term_factor  <- "Payment relative to loan (implied term)"
+other_unclear <- factor_map |> filter(type == "Hard to explain", factor != term_factor) |> pull(factor)
+```
+
+<!-- Phase 2 -->
+
+# Executive summary
+
+**Recommendation.** Use the model to support, not replace, approve/decline
+decisions, declining applicants whose predicted probability of payment
+difficulty is above **`r pct(chosen_cutoff, 0.1)`**. Before deployment, refit
+the model with three changes to its inputs: remove family status; replace or
+constrain the implied-term feature (`CREDIT_TERM`, payment divided by loan),
+for example with the actual loan term or product type; and review the other
+`r length(other_unclear)` inputs flagged as hard to explain in
+[Adverse action mapping](#adverse-action-mapping). Adverse action notices must
+state the principal reasons actually behind a decline, so an input that cannot
+be explained to an applicant has to be fixed in the model, not filtered out
+of the letter. Put the monitoring in
+[Limitations and risks](#limitations-and-risks) in place at the same time.
+
+**What the threshold means.** On training applicants scored by models that
+had not seen them, the cutoff approves `r pct(at_chosen$metrics$approval_rate, 0.1)` of applicants and
+cuts the default rate among those approved from
+`r pct(mean(scored$default), 0.01)` to
+`r pct(at_chosen$metrics$approved_default_rate, 0.01)`. It declines
+`r pct(at_chosen$metrics$recall, 1)` of applicants who went on to default;
+`r pct(1 - at_chosen$metrics$precision, 1)` of those declined would have
+repaid, which is the trade that maximises profit at a 15% margin and 90% loss
+given default. Any cutoff from `r pct(near_peak[1], 0.1)` to
+`r pct(near_peak[2], 0.1)` earns within 0.1% of the maximum. If margins are
+much thinner the cutoff should be stricter
+(`r pct(optima$cutoff[optima$scenario == "Thin margin"], 0.1)` at a 5% margin).
+
+**Expected financial impact.** Per 100,000 applicants, in the data's
+currency, the cutoff earns `r money(financial$vs_everyone)` more than
+approving everyone, and `r money(financial$vs_benchmark)` more than approving
+the same number of applicants on the external credit scores alone, with
+`r comma(financial$defaults_avoided)` fewer defaults. Against that benchmark
+it holds `r pct(financial$credit_reduction, 0.1)` less defaulted credit.
+Applied to Home Credit's annualised impairment losses
+(EUR `r comma(annual_impairment / 1e6)`M), that is up to
+EUR `r comma(financial$annual_saving / 1e6)`M a year. The business impact
+analysis reported EUR `r comma(financial$saving_at_5 / 1e6)`M because it
+compared the two scores at the 5% default-rate target, where both approve the
+`r pct(bench_5$approval_rate, 0.1)` the benchmark approves; this card compares
+them at the profit-optimal cutoff, where both approve
+`r pct(n_approved / n_applicants, 0.1)`. Both figures are upper bounds,
+because Home Credit's current process is stronger than the external scores
+alone. The BPS target of a 5% loss reduction (EUR
+`r comma(financial$bps_saving / 1e6)`M) needs
+`r pct(bps_loss_reduction / financial$credit_reduction, 1)` of that edge.
+
+**Key caveats.**
+
+- **Training data.** The model learned only from applicants Home Credit
+  approved, and its target is payment difficulty, not loss.
+- **Fairness.** Approval rates for applicants aged `r flagged_age_range` fall
+  below four-fifths of the oldest group's, in line with their higher actual
+  default rates. Marital status is still a model input; removing it costs
+  `r number(family_cost, accuracy = 0.0001)` AUC.
+- **Explaining declines.** `r pct(mean(coverage$any_flagged), 1)` of declined
+  applicants have a legally sensitive or hard-to-explain factor among their
+  top three reasons, most often the implied term
+  (`r pct(mean(coverage$any_term), 1)`). The implied term is also the
+  feature that has drifted most between training and test applicants
+  (standardised mean difference `r sprintf("%+.2f", term_smd)`). For
+  `r pct(mean(coverage$first_opaque), 1)` the main reason is the opaque
+  external credit scores.
+- **Cost assumptions.** Margin and loss given default are external
+  benchmarks, not Home Credit's own figures.
+
+# Model details
+
+```{r model-details}
+booster    <- extract_fit_engine(final_fit)
+n_features <- length(variable.names(booster))
+n_raw_cols <- ncol(raw_train) - 2   # less SK_ID_CURR and TARGET
+n_dropped  <- length(prepared$params$drop_cols)
+```
+
+- **Model:** gradient-boosted decision trees (XGBoost
+  `r as.character(packageVersion("xgboost"))`, fitted through tidymodels).
+  The output is a probability of payment difficulty (`TARGET` = 1), not an
+  approve/decline verdict.
+- **Version:** `xgb_tuned_final_nogender`, fitted on
+  `r format(final$fitted_at, "%d %B %Y")`. This card was produced on
+  `r format(Sys.Date(), "%d %B %Y")`.
+- **Training data:** all `r comma(n_applicants)` applicants in
+  `application_train` (Home Credit, via Kaggle, 2018), of whom
+  `r pct(mean(scored$default), 0.01)` had payment difficulties. Only the
+  application table is used. Of its `r n_raw_cols` input columns,
+  `r n_dropped` mostly-empty ones are dropped. Engineered ratios, missing-value
+  flags and one column per category level bring the model to
+  `r n_features` features.
+- **Tuning:** a 20-point random search on a 5,000-applicant sample, the best
+  three re-scored on a 20% comparison sample, and the tree count chosen from
+  500 to 2,000. No resampling for class imbalance: the modeling notebook
+  compared down-sampling, up-sampling and SMOTE.
+
+```{r hyperparameters}
+param_labels <- c(
+  trees          = "Number of trees",
+  mtry           = "Features considered at each split",
+  min_n          = "Minimum node size",
+  tree_depth     = "Maximum tree depth",
+  learn_rate     = "Learning rate",
+  loss_reduction = "Minimum loss reduction to split",
+  sample_size    = "Share of applicants sampled per tree"
+)
+
+tibble(parameter = names(param_labels),
+       value = c(best_trees, map_dbl(names(param_labels)[-1], \(p) as.numeric(best_params[[p]])))) |>
+  transmute(setting = param_labels[parameter],
+            parameter = paste0("`", parameter, "`"),
+            value = map_chr(value, \(v) format(signif(v, 5), big.mark = ",", scientific = FALSE))) |>
+  kable(col.names = c("Setting", "Parameter", "Value"), align = "llr")
+```
+
+**Features excluded:**
+
+- **`CODE_GENDER`**, for fairness: gender is a protected characteristic.
+  Excluding it costs `r number(gender_cost, accuracy = 0.0001)` AUC.
+- **The six supplementary tables** (credit bureau records, previous
+  applications, payment histories) were not explored in the EDA and are not
+  used.
+- **Recommended before deployment: `NAME_FAMILY_STATUS`** (see
+  [Fairness analysis](#fairness-analysis)).
+
+# Intended use
+
+**Intended use.** The model ranks Home Credit consumer-loan applicants by
+their probability of payment difficulty. It supports approve/decline
+decisions made by underwriters and policy, and lets management set a risk
+appetite by moving the cutoff.
+
+**Not intended for:**
+
+- **Pricing** loans or setting interest rates.
+- **Setting credit limits** or loan amounts.
+- **Collections** or account management after a loan is made.
+- **Applicants outside Home Credit's markets**, or populations unlike the
+  training data.
+- **Fully automated decisions without reason codes:** every decline needs
+  reasons the applicant can be given (see
+  [Adverse action mapping](#adverse-action-mapping)).
+
+# Performance metrics
+
+## Ranking accuracy (AUC)
+
+```{r auc}
+cv_auc  <- collect_metrics(cv_nogender$result) |> filter(.metric == "roc_auc")
+oof_auc <- roc_auc_vec(scored$TARGET, scored$model_risk)
+
+train_rows <- c(cv  = nrow(compare_data) * (CV_FOLDS - 1) / CV_FOLDS,
+                oof = n_applicants * (CV_FOLDS - 1) / CV_FOLDS)
+
+tibble(
+  measure = c("Cross-validation, 20% comparison sample (3-fold)",
+              "Out-of-fold, all training applicants (3-fold)",
+              "Kaggle public leaderboard",
+              "Kaggle private leaderboard"),
+  rows_per_fit = c(comma(train_rows[["cv"]], accuracy = 1000),
+                   comma(train_rows[["oof"]], accuracy = 1000),
+                   comma(n_applicants), comma(n_applicants)),
+  auc = c(number(cv_auc$mean, accuracy = 0.0001),
+          number(oof_auc, accuracy = 0.0001),
+          "0.75608", "0.75817")
+) |>
+  kable(col.names = c("Measure", "Training rows per fit", "AUC"), align = "lrr")
+```
+
+AUC is the chance that the model ranks a randomly chosen defaulter as riskier
+than a randomly chosen repayer (0.5 is random, 1.0 perfect). The
+out-of-fold and Kaggle scores
+(`r number(oof_auc, accuracy = 0.001)` and 0.758) are above the
+comparison-sample score (`r number(cv_auc$mean, accuracy = 0.001)`) because
+each fit learns from more applicants: about
+`r comma(train_rows[["oof"]], accuracy = 1000)` or all
+`r comma(n_applicants)`, rather than
+`r comma(train_rows[["cv"]], accuracy = 1000)`.
+
+## Calibration
+
+The threshold analysis below treats each predicted default probability as a
+real probability. That only holds if the predictions are calibrated: among
+applicants given a predicted risk of 10%, about 10% should default.
+
+```{r calibration-folds}
+scored |>
+  group_by(fold) |>
+  summarise(applicants        = n(),
+            predicted_default = mean(model_risk),
+            actual_default    = mean(default),
+            .groups = "drop") |>
+  mutate(fold = str_replace(fold, "Fold", "Fold "),
+         applicants = comma(applicants),
+         across(c(predicted_default, actual_default), \(x) pct(x, 0.01))) |>
+  kable(col.names = c("Fold", "Applicants", "Mean predicted default", "Actual default rate"),
+        align = "lrrr")
+```
+
+```{r calibration}
+#| fig-height: 4.5
+calibration <- calibration_table(scored$model_risk, scored$default, n = 10)
+stopifnot(sum(calibration$applicants) == n_applicants)
+
+max_calibration_gap <- max(abs(calibration$predicted_default - calibration$actual_default))
+
+ggplot(calibration, aes(predicted_default, actual_default)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey75", linetype = "dashed") +
+  geom_line(colour = model_colour, linewidth = 0.8) +
+  geom_point(colour = model_colour, size = 2.5) +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0, NA)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, NA)) +
+  coord_equal() +
+  labs(title    = "Predicted risk matches actual default rates",
+       subtitle = "Out-of-fold predictions, applicants grouped into tenths by predicted risk",
+       x = "Mean predicted default", y = "Actual default rate") +
+  theme(panel.grid.minor = element_blank())
+```
+
+Across the ten risk groups, predicted and actual default rates differ by at
+most `r number(max_calibration_gap * 100, accuracy = 0.01)` percentage points, and the mean prediction in
+each fold is within
+`r number(max(abs(tapply(scored$model_risk, scored$fold, mean) - tapply(scored$default, scored$fold, mean))) * 100, accuracy = 0.01)`
+percentage points of the actual rate. Predicted probabilities can be read as
+probabilities.
+
+## At the chosen threshold
+
+The model declines applicants whose predicted default probability is above
+`r pct(chosen_cutoff, 0.1)` (chosen in the next section). Here a "positive"
+is a predicted default, which means a decline.
+
+```{r threshold-metrics}
+m <- at_chosen$metrics
+
+tibble(
+  measure = c("Approval rate",
+              "Default rate among approved applicants",
+              "Precision: share of declined applicants who would have defaulted",
+              "Recall: share of all defaulters the model declines"),
+  value = pct(c(m$approval_rate, m$approved_default_rate, m$precision, m$recall))
+) |>
+  kable(col.names = c("Measure", "Value"), align = "lr")
+```
+
+Per 100,000 applicants:
+
+```{r confusion}
+at_chosen$confusion |>
+  arrange(desc(outcome == "Would have defaulted")) |>
+  mutate(Total = Approved + Declined,
+         across(-outcome, \(x) comma(x, accuracy = 1))) |>
+  select(outcome, Approved, Declined, Total) |>
+  kable(col.names = c("Actual outcome", "Approved", "Declined", "Total"), align = "lrrr")
+```
+
+The overall default rate is `r pct(mean(scored$default), 0.01)`. Approving at
+this threshold lowers that to `r pct(m$approved_default_rate, 0.01)` among
+approved applicants, while declining
+`r pct(1 - m$approval_rate, 0.1)` of applicants. Most declined applicants
+(`r pct(1 - m$precision, 1)`) would have repaid: that is the price of catching
+`r pct(m$recall, 1)` of defaulters, and the threshold analysis shows it is
+the profit-maximising trade.
+
+# Decision threshold analysis
+
+## Break-even rule
+
+Approving a loan of principal $C$ earns the margin $m \times C$ if it is
+repaid and loses $\text{LGD} \times C$ if it defaults. With predicted default
+probability $p$, the expected profit is
+
+$$
+(1 - p)\, m\, C \;-\; p \cdot \text{LGD} \cdot C,
+$$
+
+which is positive while
+
+$$
+p \;<\; \frac{m}{m + \text{LGD}}.
+$$
+
+Margin is net interest margin rather than net profit, because the threshold
+decides the *marginal* loan, and most operating cost does not change with one
+more approval. The thin-margin scenario covers the view that it does.
+
+```{r assumptions}
+tribble(
+  ~input, ~base, ~sensitivity, ~source,
+  "Margin on a repaid loan (share of principal)", "15%", "5%, 10%, 20%",
+  "Home Credit B.V. FY2018 results: net interest margin 15.8% (homecredit.net, results announcement, 28 Jun 2019). BPS Q1 2019: net interest income EUR 889M on EUR 18,755M loans, about 19% annualised.",
+  "Loss given default, LGD (share of principal)", "90%", "45%, 70%, 95%",
+  "Typical unsecured consumer LGD about 90% (Vergent LMS, \"Loss Given Default\"); FTC (2013), \"The Structure and Practices of the Debt Buying Industry\": charged-off debt sold for about 4 cents per dollar (7.9 cents if under 3 years old). 45% is the Basel foundation-IRB LGD for senior unsecured claims (BIS CRE32), a lenient bound: TARGET marks payment difficulty, and some flagged loans recover.",
+  "Recovery rate", "10%", "= 1 - LGD", "As above."
+) |>
+  kable(col.names = c("Input", "Base", "Sensitivity", "Source"))
+```
+
+```{r break-even}
+scenarios |>
+  transmute(scenario,
+            margin     = pct(margin, 1),
+            lgd        = pct(lgd, 1),
+            break_even = pct(break_even, 0.1)) |>
+  kable(col.names = c("Scenario", "Margin", "LGD", "Break-even predicted default"),
+        align = "lrrr")
+```
+
+## Profit by cutoff
+
+The rule above judges one loan at a time. To check it against actual
+outcomes, every training applicant is approved if their out-of-fold predicted
+default is at or below a cutoff, and the profit is totalled from what actually
+happened:
+
+$$
+\text{profit} \;=\; m \sum_{\text{approved, repaid}} C \;-\; \text{LGD} \sum_{\text{approved, defaulted}} C,
+$$
+
+using each loan's raw `AMT_CREDIT` (in the data's currency, not converted),
+for cutoffs from `r pct(min(cutoffs), 0.1)` to `r pct(max(cutoffs), 1)` in
+steps of 0.5 points, per 100,000 applicants.
+
+```{r profit-chart}
+#| fig-height: 5.5
+scenario_colours <- c("Base"             = model_colour,
+                      "Lenient recovery" = "#2F9E44",
+                      "Thin margin"      = "#E8590C",
+                      "High margin"      = "#7048E8")
+
+ggplot(scenario_curves, aes(cutoff, profit / 1e6, colour = scenario)) +
+  geom_hline(yintercept = 0, colour = "grey80", linewidth = 0.4) +
+  geom_line(linewidth = 0.9) +
+  geom_point(data = optima, size = 3) +
+  geom_text(data = optima, aes(label = pct(cutoff, 0.1)),
+            vjust = -0.9, size = 3.5, show.legend = FALSE) +
+  scale_colour_manual(values = scenario_colours) +
+  scale_x_continuous(labels = percent_format(accuracy = 1), breaks = seq(0, 0.4, 0.05)) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0.05, 0.1))) +
+  labs(title    = "Profit peaks near each scenario's break-even cutoff",
+       subtitle = "Profit per 100,000 applicants approving everyone at or below the cutoff",
+       x = "Cutoff: highest predicted default approved",
+       y = "Profit (millions, data currency)",
+       colour = NULL) +
+  theme(legend.position = "top", legend.justification = "left",
+        plot.title.position = "plot",
+        panel.grid.minor = element_blank())
+```
+
+```{r optima}
+optima |>
+  transmute(scenario,
+            break_even        = pct(break_even, 0.1),
+            optimal_cutoff    = pct(cutoff, 0.1),
+            approval_rate     = pct(approval_rate, 0.1),
+            approved_default  = pct(default_rate, 0.01),
+            profit            = money(profit),
+            vs_everyone       = paste0("+", money(vs_everyone))) |>
+  kable(col.names = c("Scenario", "Break-even", "Optimal cutoff", "Approval rate",
+                      "Default rate among approved", "Profit per 100k",
+                      "vs approve everyone"),
+        align = "lrrrrrr")
+```
+
+In every scenario the empirical optimum lands within
+`r number(max(abs(optima$cutoff - optima$break_even)) * 100, accuracy = 0.1)`
+points of the break-even rule, as calibrated predictions should. The
+base-case curve is flat near its peak: every cutoff from
+`r pct(near_peak[1], 0.1)` to `r pct(near_peak[2], 0.1)` earns within 0.1% of
+the maximum, so the exact cutoff matters less than being in that range.
+
+## Sensitivity
+
+The optimal cutoff for each combination of margin and LGD:
+
+```{r sensitivity}
+#| fig-height: 4
+sensitivity <- expand_grid(margin = c(0.05, 0.10, 0.15, 0.20),
+                           lgd    = c(0.45, 0.70, 0.90, 0.95)) |>
+  mutate(optimal = map2_dbl(margin, lgd, \(m, l) {
+           p <- add_profit(sweep, m, l)
+           p$cutoff[which.max(p$profit)]
+         }),
+         break_even = break_even_cutoff(margin, lgd))
+
+stopifnot(all(sensitivity$optimal > min(cutoffs) & sensitivity$optimal < max(cutoffs)))
+
+ggplot(sensitivity, aes(factor(lgd), factor(margin), fill = optimal)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%s\n(break-even %s)", pct(optimal, 0.1), pct(break_even, 0.1)),
+                colour = optimal > 0.2),
+            size = 3.3, lineheight = 0.9, show.legend = FALSE) +
+  scale_fill_gradient(low = "#EDF2FF", high = "#364FC7", guide = "none") +
+  scale_colour_manual(values = c(`FALSE` = "grey15", `TRUE` = "white")) +
+  scale_x_discrete(labels = \(x) percent(as.numeric(x))) +
+  scale_y_discrete(labels = \(x) percent(as.numeric(x))) +
+  labs(title    = "Thinner margins and higher losses call for a stricter cutoff",
+       subtitle = "Optimal cutoff (break-even rule in brackets)",
+       x = "Loss given default", y = "Margin") +
+  theme(panel.grid = element_blank())
+```
+
+## Comparison with the 5% risk-appetite cutoff
+
+```{r target-compare}
+cutoff_5   <- sort(scored$model_risk)[at_target_rate(model_path, 0.05)$approved]
+
+at_5 <- add_profit(cutoff_sweep(scored$model_risk, scored$default, scored$credit, cutoff_5),
+                   base$margin, base$lgd)
+at_chosen_profit <- add_profit(cutoff_sweep(scored$model_risk, scored$default, scored$credit,
+                                            chosen_cutoff),
+                               base$margin, base$lgd)
+
+tibble(rule = c("Profit-maximising (base case, chosen)", "5% default-rate target"),
+       cutoff = c(chosen_cutoff, cutoff_5),
+       approval_rate = c(at_chosen_profit$approval_rate, at_5$approval_rate),
+       default_rate  = c(at_chosen_profit$default_rate, at_5$default_rate),
+       profit        = c(at_chosen_profit$profit, at_5$profit)) |>
+  mutate(cutoff = pct(cutoff, 0.1), approval_rate = pct(approval_rate, 0.1),
+         default_rate = pct(default_rate, 0.01), profit = money(profit)) |>
+  kable(col.names = c("Rule", "Cutoff", "Approval rate", "Default rate among approved",
+                      "Profit per 100k"),
+        align = "lrrrr")
+```
+
+The business impact analysis set the cutoff from a risk appetite: approve
+as many applicants as possible while keeping the default rate among them at
+5%, which gave a cutoff of `r pct(cutoff_5, 0.1)`. The profit-maximising
+cutoff under the base case is `r pct(chosen_cutoff, 0.1)`, within
+`r number(abs(chosen_cutoff - cutoff_5) * 100, accuracy = 0.1)` points, and the
+5% target earns `r money(at_chosen_profit$profit - at_5$profit)` less per
+100,000 applicants
+(`r pct((at_chosen_profit$profit - at_5$profit) / at_chosen_profit$profit, 0.01)`).
+The two ways of setting the threshold agree.
+
+**Chosen threshold: decline applicants with a predicted default probability
+above `r pct(chosen_cutoff, 0.1)`.** It is the base-case optimum, rounded to
+the nearest 0.5 points, and it is used for every result in the rest of this
+card.
+
+**Caveat.** Margin and LGD are applied to the full principal over the loan's
+life. That ignores timing (interest is earned over months, losses arrive
+later), partial repayment before default, and discounting.
+
+# Explainability
+
+## Method
+
+The model's decisions are explained with **SHAP values**, computed with
+XGBoost's built-in TreeSHAP. For each applicant, SHAP splits the predicted
+log-odds of default into one contribution per feature, measured against the
+model's baseline for an average applicant. The contributions add up exactly
+to the applicant's prediction.
+
+The explanations use a random sample of 1,000 applicants from the **test
+set**: applicants the model never saw during training, as a new applicant
+would be. Their outcomes are unknown, so this section explains decisions but
+does not judge whether they were right. The final model's predictions on the
+test set are spread like the out-of-fold predictions the threshold was set
+on, so the chosen cutoff applies to them:
+
+```{r shap-sample}
+test_risk   <- predict(final_fit, test, type = "prob")$.pred_1
+
+probs <- c(0.10, 0.25, 0.50, 0.75, 0.90)
+rbind(`Out-of-fold (training applicants)`   = quantile(scored$model_risk, probs),
+      `Final model (all test applicants)`   = quantile(test_risk, probs),
+      `Final model (1,000-applicant sample)` = quantile(shap_risk, probs)) |>
+  apply(2, \(x) pct(x, 0.1)) |>
+  kable(caption = "Predicted default at percentiles of each distribution", align = "rrrrr")
+```
+
+## Most influential factors
+
+Features that encode the same thing about the applicant are combined: age
+appears as birth date, age in years and age band; the external scores as
+each score plus their mean, minimum, maximum and count; a category as one
+column per level. Each bar below is one thing about the applicant.
+
+```{r importance-chart}
+#| fig-height: 6
+importance |>
+  slice_head(n = 15) |>
+  ggplot(aes(mean_abs, fct_reorder(factor, mean_abs))) +
+  geom_col(fill = model_colour, width = 0.7) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(title    = "External credit scores dominate the model's decisions",
+       subtitle = "Mean absolute SHAP value (log-odds), 1,000 test applicants, top 15 factors",
+       x = "Mean |SHAP| (log-odds of default)", y = NULL) +
+  theme(plot.title.position = "plot",
+        panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
+```
+
+External credit scores account for
+`r pct(importance$share[importance$factor == "External credit scores"], 1)` of
+the total, more than the next
+`r sum(cumsum(importance$share[-1]) <= importance$share[1])` factors combined.
+
+The ten most influential individual features, one dot per applicant. Dots to
+the right raise predicted risk; colour shows the applicant's value of that
+feature, from low to high:
+
+```{r beeswarm}
+#| fig-height: 6
+shap_matrix  <- as.matrix(select(shap_wide, -.row))
+shown_values <- feature_values
+
+# Shorter display names for long dummy columns.
+short_name <- \(x) str_replace(x, "^NAME_EDUCATION_TYPE_(.*)$", "EDUCATION = \\1")
+colnames(shap_matrix) <- short_name(colnames(shap_matrix))
+names(shown_values)   <- short_name(names(shown_values))
+
+sv <- shapviz(shap_matrix, X = shown_values, baseline = baseline_log_odds)
+
+sv_importance(sv, kind = "beeswarm", max_display = 10, alpha = 0.5, size = 1.2) +
+  labs(title    = "How each feature's value moves predicted risk",
+       subtitle = "SHAP value per applicant, 1,000 test applicants",
+       x = "SHAP value (log-odds of default)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title.position = "plot")
+```
+
+```{r direction-table}
+importance |>
+  slice_head(n = 10) |>
+  left_join(factor_map, by = "factor") |>
+  transmute(rank = row_number(), factor, share = pct(share, 0.1), direction) |>
+  kable(col.names = c("Rank", "Factor", "Share of total |SHAP|", "Direction"),
+        align = "rlrl")
+```
+
+```{r age-effect}
+age_effect <- grouped |>
+  filter(factor == "Age") |>
+  mutate(age_band = shap_sample$AGE_BAND[.row]) |>
+  group_by(age_band) |>
+  summarise(applicants = n(), mean_contribution = mean(contribution), .groups = "drop")
+
+older_effect <- age_effect |>
+  filter(as.numeric(str_extract(age_band, "\\d+")) >= 60)
+```
+
+Age's contribution is not monotone. Once the other factors are known,
+applicants in their 30s and 40s get the largest increase from age, while the
+youngest and oldest get a decrease:
+
+```{r age-table}
+age_effect |>
+  mutate(mean_contribution = number(mean_contribution, accuracy = 0.001)) |>
+  kable(col.names = c("Age band", "Applicants in sample", "Mean age contribution (log-odds)"),
+        align = "lrr")
+```
+
+# Adverse action mapping
+
+A declined applicant is entitled to the main reasons for the decision. Each
+factor below maps the condition that raises an applicant's risk to the reason
+text a decline letter would use. The table covers the ten most influential
+factors and every factor that is among the top three reasons for any of the
+sampled applicants the model would decline. Flags mark factors that are
+legally sensitive, hard to explain to an applicant, or opaque third-party
+scores.
+
+```{r adverse-map}
+importance |>
+  filter(factor %in% union(top_factors$factor, declined_top3$factor)) |>
+  left_join(factor_map, by = "factor") |>
+  left_join(declined_counts, by = "factor") |>
+  transmute(factor, condition, reason,
+            in_top3 = replace_na(in_top3, 0L),
+            flag = if_else(flag == "", type, paste0(type, ": ", flag))) |>
+  kable(col.names = c("Factor", "Raises risk when", "Reason given to applicant",
+                      sprintf("Top-3 reason for (of %d declined)", length(declined_rows)),
+                      "Flag"),
+        align = "lllrl")
+```
+
+- **External credit scores** are third-party scores whose inputs Home Credit
+  does not see, so the reason can only be generic.
+- **Age** may be used in an empirically derived system under ECOA, but not to
+  the detriment of elderly applicants. In this sample, the mean age
+  contribution for applicants 60 and over is
+  `r number(weighted.mean(older_effect$mean_contribution, older_effect$applicants), accuracy = 0.001)`
+  log-odds (`r if_else(weighted.mean(older_effect$mean_contribution, older_effect$applicants) < 0, "it lowers their predicted risk", "it raises their predicted risk")`).
+- **Education level** and **family status** are proxy and protected-basis
+  concerns: marital status is a prohibited basis under ECOA, and both remain
+  in the model.
+
+## Examples
+
+Three test applicants above the `r pct(chosen_cutoff, 0.1)` cutoff, the
+applicants at the 25th, 50th and 75th percentile of predicted risk among
+those the model would decline:
+
+```{r adverse-examples}
+#| results: asis
+picks <- map_int(c(0.25, 0.50, 0.75), \(q) {
+  target <- quantile(shap_risk[declined_rows], q, type = 1)
+  declined_rows[which.min(abs(shap_risk[declined_rows] - target))]
+})
+stopifnot(length(unique(picks)) == 3, all(shap_risk[picks] > chosen_cutoff))
+
+examples <- grouped |>
+  filter(.row %in% picks, contribution > 0) |>
+  group_by(.row) |>
+  slice_max(contribution, n = 3, with_ties = FALSE) |>
+  ungroup() |>
+  left_join(factor_map, by = "factor")
+stopifnot(!anyNA(examples$reason))
+
+for (i in seq_along(picks)) {
+  r <- picks[i]
+  cat(sprintf("\n**Applicant %s** (test ID %s): predicted default %s\n\n",
+              LETTERS[i], shap_sample$SK_ID_CURR[r], pct(shap_risk[r], 0.1)))
+  examples |>
+    filter(.row == r) |>
+    arrange(desc(contribution)) |>
+    transmute(rank = row_number(), factor, reason,
+              log_odds = number(contribution, accuracy = 0.01),
+              type) |>
+    kable(col.names = c("Rank", "Factor", "Reason given", "Contribution (log-odds)", "Flag"),
+          align = "rllrl") |>
+    print()
+  cat("\n")
+}
+```
+
+`r length(declined_rows)` of the 1,000 sampled applicants
+(`r pct(length(declined_rows) / 1000, 0.1)`) would be declined at the chosen
+cutoff. Of these:
+
+- `r pct(mean(coverage$any_flagged), 1)` have at least one legally sensitive
+  or hard-to-explain factor among their top three reasons. The implied-term
+  factor alone appears for `r pct(mean(coverage$any_term), 1)`.
+- `r pct(mean(coverage$any_sensitive), 1)` have a legally sensitive factor in
+  their top three.
+- For `r pct(mean(coverage$first_flagged), 1)` the main reason is flagged.
+  For `r pct(mean(coverage$first_opaque), 1)` it is the external credit
+  scores, which can only be explained generically.
+
+Adverse action notices must state the principal reasons actually behind a
+decline, so flagged factors cannot be skipped or reworded at the letter
+stage. The fix belongs in the model: before deployment, replace or constrain
+the implied-term feature (for example with the actual loan term or product
+type) and review the other inputs flagged as hard to explain.
+
+# Fairness analysis
+
+`CODE_GENDER` is excluded from the model, which costs
+`r number(gender_cost, accuracy = 0.0001)` AUC on the comparison folds.
+Excluding a protected attribute does not by itself make outcomes fair: age and education remain in the model and the EDA
+found both correlate with protected characteristics. This section checks
+outcomes at the `r pct(chosen_cutoff, 0.1)` cutoff on out-of-fold
+predictions.
+
+The **adverse impact ratio** is a group's approval rate divided by the
+highest group's. Under the four-fifths rule, a ratio below 0.80 is evidence
+of adverse impact worth reviewing. The rule comes from US employment
+guidance (the EEOC's Uniform Guidelines on Employee Selection Procedures);
+here it is a screening heuristic, not a legal test for lending. The actual
+default rate is shown next to it: a gap in approval that follows a gap in repayment is the model doing its
+job; a gap that does not is a problem.
+
+## Gender
+
+```{r fairness-gender}
+fairness_table(by_gender, "Gender")
+```
+
+`r n_xna` applicants with gender recorded as `XNA` (unknown) are left out.
+
+## Education
+
+```{r fairness-education}
+fairness_table(by_education |> arrange(desc(applicants)), "Education")
+```
+
+## Age
+
+```{r fairness-age}
+fairness_table(by_age, "Age band")
+```
+
+## Family status
+
+`NAME_FAMILY_STATUS` (marital status) is still in the model, and marital
+status is a prohibited basis under ECOA. Excluding it as well, with
+everything else in the final configuration unchanged, changes AUC on the
+comparison folds by:
+
+```{r family-cost}
+family_paired |>
+  transmute(fold = str_replace(id, "Fold", "Fold "),
+            with_family    = number(xgb_tuned_nogender, accuracy = 0.0001),
+            without_family = number(xgb_tuned_nogender_nofamily, accuracy = 0.0001),
+            cost           = number(difference, accuracy = 0.0001)) |>
+  kable(col.names = c("Fold", "AUC with family status", "AUC without", "Cost of excluding"),
+        align = "lrrr")
+```
+
+The mean cost is `r number(family_cost, accuracy = 0.0001)` AUC
+(`r sum(family_paired$difference > 0)` of 3 folds lower without it), against
+`r number(gender_cost, accuracy = 0.0001)` for `CODE_GENDER`.
+
+**Recommendation before deployment:** refit the final model without
+`NAME_FAMILY_STATUS`. The measured cost is small, and keeping a prohibited
+basis as a model input is a legal risk that the accuracy does not justify.
+This card describes the model as fitted, with family status included; the
+refit would need its own out-of-fold check before replacing it.
+
+# Limitations and risks
+
+```{r limitations-compute}
+ext1_missing <- mean(is.na(raw_train$EXT_SOURCE_1))
+no_ext_score <- sum(train$EXT_SOURCE_COUNT == 0)
+ext_share    <- importance$share[importance$factor == "External credit scores"]
+
+bureau_col   <- "AMT_REQ_CREDIT_BUREAU_QRT"
+bureau_na    <- is.na(raw_train[[bureau_col]])
+bureau_fill  <- prepared$params$numeric_medians[[bureau_col]]
+bureau_zero  <- !bureau_na & raw_train[[bureau_col]] == 0
+# All six enquiry counts are missing on the same rows.
+stopifnot(bureau_fill == 0,
+          all(map_lgl(select(raw_train, starts_with("AMT_REQ_CREDIT_BUREAU")),
+                      \(x) identical(is.na(x), bureau_na))))
+```
+
+- **Approved applicants only.** The training data holds only applicants Home
+  Credit approved. How declined applicants would have repaid is unknown (no
+  reject inference), so the model may misjudge applicant types the current
+  process screens out.
+- **`TARGET` marks payment difficulty, not loss.** Some flagged loans recover
+  in full. The profit figures treat every default as a loss of
+  `r pct(base$lgd, 1)` of principal.
+- **Application table only.** Credit bureau history, previous applications
+  and payment histories are not used. They may hold signal the model misses.
+- **Data context.** One lender's applicants, circa 2018. Amounts are in the
+  data's own currency, not converted, so financial figures per 100,000
+  applicants are in that currency. Only the BPS scaling is in euros.
+- **Drift between training and test applicants.** Test loans are smaller
+  relative to income and carry shorter implied terms. A standardised mean
+  difference above 0.1 is worth a closer look:
+
+```{r drift-table}
+drift |>
+  transmute(feature = paste0("`", predictor, "`"),
+            across(c(train_median, test_median), \(x)
+              map_chr(x, \(v) format(signif(v, 3), big.mark = ",", scientific = FALSE))),
+            flag = if_else(abs(smd) > 0.1, "Above 0.1", ""),
+            smd  = number(smd, accuracy = 0.01)) |>
+  relocate(flag, .after = last_col()) |>
+  kable(col.names = c("Feature", "Train median", "Test median", "Standardised mean difference", ""),
+        align = "lrrrl")
+```
+
+- **Heavy reliance on external scores.** External credit scores carry
+  `r pct(ext_share, 1)` of the model's SHAP importance, but their inputs are
+  unknown to Home Credit. `EXT_SOURCE_1` is missing for
+  `r pct(ext1_missing, 1)` of applicants, and `r comma(no_ext_score)` have
+  no external score at all.
+- **Proxies for protected traits.** Gender is excluded, but age, education,
+  marital status, region and social-circle defaults remain inputs. Approval
+  rates for applicants aged `r flagged_age_range` fall below the four-fifths
+  line.
+- **Bureau enquiries: missing counted as zero.** `r pct(mean(bureau_na), 1)`
+  of applicants have no bureau-enquiry record (`r bureau_col` and the other
+  enquiry counts are missing). Data preparation filled these with the
+  median, `r bureau_fill`, so "no enquiries" mixes in "no bureau record".
+  The two groups default at different rates
+  (`r pct(mean(raw_train$TARGET[bureau_na]), 0.1)` with no record,
+  `r pct(mean(raw_train$TARGET[bureau_zero]), 0.1)` with zero recorded
+  enquiries). This is a data-preparation issue to fix in a refit, for example
+  with a missing-value flag.
+- **Legal reference.** The legal flags in this card use the US Equal Credit
+  Opportunity Act (ECOA) as the reference. Home Credit's markets have their
+  own consumer-lending and anti-discrimination rules, which a deployment
+  review would need to apply.
+- **Cost assumptions are external benchmarks.** The 15% margin and 90% loss
+  given default come from published figures and industry norms, not Home
+  Credit's own loan-level economics. The chosen cutoff moves with them (see
+  [Sensitivity](#sensitivity)).
+
+## Monitoring
+
+Once deployed, the model should be checked regularly against these triggers:
+
+- **Input drift:** standardised mean difference of the key features between
+  recent applicants and the training data. Review above 0.1.
+- **Calibration:** predicted against actual default rate by tenth of
+  predicted risk, as outcomes mature. The threshold math depends on it.
+- **Approval rates by group:** gender, education and age band, with impact
+  ratios. Review any group below 0.80, or any change since deployment.
+- **Decline reasons:** how often each reason, and each flagged factor, is
+  cited.
+- **Ranking:** AUC on matured loans against the
+  `r number(oof_auc, accuracy = 0.001)` out-of-fold baseline.
+
+# Use of AI
+
+I used Claude in two ways. In chat, it researched the cost assumptions and
+their sources, wrote the brief for this card, and reviewed each stage of the
+output. In Claude Code, it wrote the R code and drafted the text. I reviewed
+and approved each analytic decision, including scoring SHAP on unseen test
+applicants and measuring the cost of excluding family status, and I rewrote
+the narrative in my own words.
+
+# Appendix: reproducibility
+
+Every model result in this card was loaded from the modeling notebook's
+caches; nothing was refit:
+
+```{r cache-log}
+tibble(line = cache_log) |>
+  mutate(name = str_match(line, "for (\\S+) from")[, 2],
+         file = str_match(line, "from (\\S+) \\(")[, 2],
+         fitted = str_match(line, "fit ([0-9-]+ [0-9:]+)")[, 2]) |>
+  select(name, file, fitted) |>
+  kable(col.names = c("Result", "Cache file", "Fitted"))
+```
